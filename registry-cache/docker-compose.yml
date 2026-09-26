@@ -1,0 +1,34 @@
+# 飞牛当镜像拉取缓存 —— 给爱快用
+#
+# 原理：爱快自己没有代理配置入口，拉不动/拉得慢。飞牛能通过爱快上的
+#       clash(192.168.3.4:7890) 出网，所以让飞牛做 Docker Hub 的
+#       pull-through cache，爱快改成从这个内网地址拉。
+#
+#  爱快 install → 飞牛 registry 缓存 → (经 clash) → Docker Hub
+#                      ↑ 命中缓存则直接内网返回
+#
+# 部署：把本目录放到飞牛（如 /vol1/1000/docker/registry-cache），执行
+#         docker compose up -d
+#
+# 注意：镜像名带了 docker.1ms.run 前缀，是为了绕开飞牛 daemon.json 里
+#       那两个坏掉的 registry-mirrors（不改系统配置）。
+#       registry:2 是 Go 程序，会尊重 HTTP_PROXY / HTTPS_PROXY 环境变量。
+
+services:
+  registry:
+    image: docker.1ms.run/library/registry:2
+    container_name: ikuai-registry-cache
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      # 缓存 Docker Hub（官方镜像库）
+      REGISTRY_PROXY_REMOTEURL: "https://registry-1.docker.io"
+      # 上游走 clash 代理出网；内网直连不走代理
+      HTTP_PROXY: "http://192.168.3.4:7890"
+      HTTPS_PROXY: "http://192.168.3.4:7890"
+      NO_PROXY: "localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12"
+      # 允许删缓存（清理空间用）
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+    volumes:
+      - /vol1/1000/docker/registry-cache/data:/var/lib/registry

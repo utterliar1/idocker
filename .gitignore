@@ -1,0 +1,44 @@
+# ============================================================
+# 爱快 Docker 容器更新器 —— 忽略规则
+# ============================================================
+
+# ---------- 凭据 / 本地配置（绝对不能入库）----------
+.env
+.env.*
+!.env.example
+config.json
+webapp/.env
+webapp/config.json
+
+# ---------- 运行时产物（随时可重新生成）----------
+# 上游 digest 缓存、日志、数据卷内容
+state.json
+data/
+webapp/data/
+*.log
+
+# ---------- 逆向抓取的爱快前端产物 ----------
+# _mine/ 是用 capture-ikuai-api.js 从爱快管理后台抓下来的打包 chunk
+# （约 8 MB / 211 个文件），只用来挖 docker_* 接口。它不是本项目的代码，
+# 也不含任何原创内容，因此不入库；挖出来的结论已整理进 API_REFERENCE.md。
+_mine/
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# ---------- 编辑器 / 操作系统 ----------
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ---------- 本地临时排查 ----------
+_test/lucky_backup_*.json
+scratch/

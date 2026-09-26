@@ -1,0 +1,66 @@
+# ============================================================
+# 爱快 Docker 容器更新器 —— 飞牛 NAS（fnOS）Compose 部署
+#
+# 用法（在飞牛「Docker → Compose 项目」里粘贴本文件，或 SSH 到本目录执行）：
+#     docker compose up -d --build
+#
+# 配置优先级：同目录 .env 文件 > 下面的默认值
+# 建议 cp .env.example .env 再改 .env，这样密码不写进本文件。
+#
+# 常见坑（飞牛实测）：
+#   · 拉不到基础镜像（docker.fnnas.com 返回 401）
+#       -> 在 .env 里设 BASE_IMAGE=docker.1ms.run/library/python:3.13-alpine
+#   · 8088 端口被 filebrowser 占用
+#       -> 在 .env 里把 WEB_PORT 改成 3001 之类
+# ============================================================
+
+services:
+  idocker:
+    build:
+      context: .
+      # 拉不到 docker.io 时，在 .env 里把 BASE_IMAGE 换成加速源地址，例如：
+      #   BASE_IMAGE=docker.1ms.run/library/python:3.13-alpine
+      args:
+        BASE_IMAGE: "${BASE_IMAGE:-python:3.13-alpine}"
+    # 想跳过本地构建、直接用 CI 产出的官方镜像，就注释掉上面的 build:，
+    # 并把下面这行换成：
+    #   image: ghcr.io/utterliar1/idocker:latest
+    image: idocker:1.3.3
+    container_name: idocker
+    restart: unless-stopped
+
+    # 左边是飞牛上的对外端口，冲突就改左边。
+    # 注意：飞牛的 filebrowser 默认就占 8088，建议直接改成 3001 之类。
+    ports:
+      - "${WEB_PORT:-8088}:8088"
+
+    environment:
+      # ---------- 必填：爱快路由器 ----------
+      IKUAI_URL: "${IKUAI_URL:-192.168.123.1}"      # 爱快后台地址（可带 http(s):// 前缀）
+      IKUAI_USER: "${IKUAI_USER:-admin}"            # 登录账号
+      IKUAI_PASS: "${IKUAI_PASS:-请改成你的密码}"     # 登录密码
+
+      # ---------- 建议填：给网页加访问认证 ----------
+      AUTH_USER: "${AUTH_USER:-admin}"              # 留空则关闭认证（仅限内网！）
+      AUTH_PASS: "${AUTH_PASS:-请改成访问密码}"
+
+      # ---------- 可选 ----------
+      WEB_PORT: "8088"
+      TZ: "Asia/Shanghai"
+      # 等待镜像下载的最长秒数。这只是「初始默认值」——
+      # 页面上「设置」里改过的值会存进 /data/settings.json 并优先生效。
+      PULL_TIMEOUT: "${PULL_TIMEOUT:-1800}"
+      DRY_RUN: "0"                                   # 1 = 全程只演练不真改容器
+      HTTP_TIMEOUT: "20"                             # 访问爱快接口超时
+      # 仅作兜底：上游版本检测优先用「爱快 Docker 服务设置里配的加速源」，
+      # 读不到（或爱快没配）时才用这里。想换源就该去爱快后台改，而不是改这里。
+      REGISTRIES: "${REGISTRIES:-https://docker.1ms.run,https://hub.rat.dev,https://docker.m.daocloud.io}"
+
+    volumes:
+      # 存放状态与执行历史；用命名卷可避免飞牛上的目录权限问题
+      # ⚠️ 卷名刻意保持 ikuai-updater-data 不改：改名会让容器挂到一个空卷上，
+      #    已保存的设置（下载超时）与全部执行历史都不会跟过来。
+      - ikuai-updater-data:/data
+
+volumes:
+  ikuai-updater-data:

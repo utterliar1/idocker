@@ -1,0 +1,207 @@
+name: ci
+
+# ============================================================
+# 流水线：验证 → 构建推送 ghcr.io → 冒烟测试
+#
+#   test    起假爱快 + 真 server 跑后端回归，再用 DOM 桩跑前端回归
+#   build   仅当 test 全绿才构建镜像并推到 ghcr.io（PR 不推）
+#   smoke   把刚推上去的镜像真拉下来起容器，探活 + 校验静态资源
+#
+# 也就是说：验证没过 = 不会产出镜像；镜像产出后还要自己先跑得起来。
+# ============================================================
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 读代码 + 推包（推 ghcr.io 用 GITHUB_TOKEN，不需要额外配 secret）
+permissions:
+  contents: read
+  packages: write
+
+env:
+  # ghcr 要求镜像名全小写
+  IMAGE: ghcr.io/utterliar1/idocker
+
+# 同一分支连推多次时，取消上一次还没跑完的
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ------------------------------------------------------------
+  # 1. 验证
+  # ------------------------------------------------------------
+  test:
+    name: 验证 · 后端 + 前端回归
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: 准备 Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # 代码本体是纯标准库 / 零依赖，所以这里刻意不装任何第三方包 ——
+      # 装了反而会掩盖「运行时其实不需要 pip」这个设计前提。
+      - name: 全量语法自检
+        run: python -m compileall -q webapp/app _test
+
+      - name: 后端回归（假爱快 + 真 server，83 项）
+        run: python _test/test_webapp.py
+
+      - name: 前端回归（DOM 桩跑真 app.js，24 项）
+        run: node _test/test_frontend.js
+
+  # ------------------------------------------------------------
+  # 2. 构建并推送 ghcr.io（test 绿了才跑，PR 不推）
+  # ------------------------------------------------------------
+  build:
+    name: 构建 · 推送 ghcr.io
+    needs: [test]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      # 给冒烟测试用的确定性标签（metadata-action 的 type=sha,format=short 产物）
+      smoke_ref: ${{ steps.shortsha.outputs.ref }}
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 准备 buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成镜像标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+
+      - name: 记下本次的短 sha 标签
+        id: shortsha
+        run: echo "ref=${IMAGE}:sha-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v6
+        with:
+          context: ./webapp
+          # 飞牛 NAS / 主流 x86 设备都是 amd64；
+          # 若要在 arm64 设备（树莓派等）上跑，这里加 ,linux/arm64 即可（走 QEMU，会慢些）。
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 打 tag 时注入 git tag 当版本号；分支构建标记为 dev。
+          # 镜像上还会带 org.opencontainers.image.revision = 完整 commit sha。
+          build-args: |
+            APP_VERSION=${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 写入构建摘要
+        run: |
+          {
+            echo "### 已推送到 ghcr.io"
+            echo ""
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo ""
+            echo "- 架构：linux/amd64"
+            echo "- 短 sha：\`${{ steps.shortsha.outputs.ref }}\`"
+            echo "- base：\`python:3.13-alpine\`（Dockerfile 默认，CI 走官方源）"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------
+  # 3. 冒烟测试：把刚推上去的镜像真跑起来
+  # ------------------------------------------------------------
+  smoke:
+    name: 冒烟 · 真拉真起真探活
+    needs: [build]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 登录 ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 拉起容器
+        run: |
+          set -euo pipefail
+          IMG="${{ needs.build.outputs.smoke_ref }}"
+          echo "被测镜像：$IMG"
+          docker pull "$IMG"
+          # 爱快地址故意指向一个连不通的端口：验证「爱快不可达时服务照样起得来」。
+          # 不设 AUTH_USER = 关闭网页认证，方便直接探活。
+          docker run -d --name smoke -p 18088:8088 \
+            -e IKUAI_URL=http://127.0.0.1:1 \
+            -e IKUAI_USER=ci -e IKUAI_PASS=ci-only \
+            -e REGISTRIES=http://127.0.0.1:1 \
+            -e HTTP_TIMEOUT=3 \
+            "$IMG"
+
+      - name: 探活 /api/health
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://127.0.0.1:18088/api/health; then
+              echo "第 $i 次探活通过"
+              curl -fsS http://127.0.0.1:18088/api/health; echo
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::30 次探活均失败"
+          docker logs smoke 2>&1 | tail -40
+          exit 1
+
+      - name: 首页与静态资源能正常返回
+        run: |
+          set -euo pipefail
+          curl -fsS http://127.0.0.1:18088/ | grep -q "爱快 Docker 容器更新器"
+          curl -fsS -o /dev/null http://127.0.0.1:18088/static/app.js
+          curl -fsS -o /dev/null http://127.0.0.1:18088/static/style.css
+          echo "首页 + app.js + style.css 均 200"
+
+      - name: 容器自带健康检查脚本能通过
+        run: docker exec smoke python healthcheck.py
+
+      - name: 确认非 root 运行
+        run: |
+          set -euo pipefail
+          whoami=$(docker exec smoke id -un)
+          echo "容器内用户：$whoami"
+          test "$whoami" = "appuser"
+
+      - name: 失败时 dump 容器日志
+        if: failure()
+        run: docker logs smoke 2>&1 | tail -60 || true

@@ -1,0 +1,29 @@
+{
+  "_说明": "可选项。默认情况下脚本直接读 ../.env 里的 ikuai_url / ikuai_id / ikuai_pw，不需要本文件。只有需要覆盖默认值时才复制成 config.json。",
+
+  "router": {
+    "url": "192.168.123.1",
+    "_url_说明": "删掉这一行就用 .env 的 ikuai_url。带端口就写 192.168.1.1:81",
+    "username": "wlup",
+    "password": "",
+    "_password_说明": "留空就用 .env 的 ikuai_pw；脚本自己算 md5 和 base64(salt_11+密码)，不必手填哈希",
+    "login_path": "/Action/login",
+    "timeout": 20
+  },
+
+  "registries": [
+    "https://docker.1ms.run",
+    "https://docker.m.daocloud.io",
+    "https://docker.nju.edu.cn"
+  ],
+  "_registries_说明": "check 命令按顺序尝试，第一个成功的就用。和你路由器上的加速源保持一致",
+
+  "notify_webhook": "",
+  "_notify_webhook_说明": "可选。企业微信/钉钉机器人、Server酱的 webhook 地址，留空则不通知",
+  "notify_body": {
+    "msgtype": "text",
+    "text": {
+      "content": "{message}"
+    }
+  }
+}

@@ -1,0 +1,1000 @@
+/* ============================================================
+   爱快 Docker 容器更新器 —— 前端逻辑
+   通过 SSE 实时接收六步执行事件，驱动流程图与日志终端
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var $ = function (id) { return document.getElementById(id); };
+  var state = {
+    containers: [],
+    checkMap: {},        // "repo:tag" → 上游状态
+    checkAt: "",
+    selected: {},
+    job: null,
+    source: null,
+    flow: [],
+    logs: [],
+    mirrors: [],         // 爱快 Docker 服务设置里的镜像加速源
+    inited: false,
+    progress: { current: 0, total: 0 },
+    target: null,        // 当前正在选版本的容器
+    settings: {},        // 下载超时 + 定时任务
+    setInited: false,
+    scEdit: null,        // 正在编辑的定时任务（null = 新建）
+    scMode: "check",
+    scFreq: "every",
+    // ---- 自动刷新 ----
+    auto: true,          // 自动刷新开关（用户点按钮可暂停）
+    busy: false,         // 有任务已提交/正在执行，自动刷新让路
+    autoTimer: null,
+    nextAt: 0,           // 下一次自动刷新的时刻（ms）
+    lastRefresh: 0,      // 上次成功刷新的时刻（秒）
+    ctSig: "",           // 容器表 HTML 指纹，用于跳过无变化的重绘
+    histSig: ""          // 历史列表 HTML 指纹
+  };
+
+  var STEP_ORDER = ["login", "inspect", "pull", "download", "update", "verify"];
+  // 自动刷新间隔：默认 60 秒；可用 ?autorefresh=秒数 覆盖（5~3600），方便调试
+  var AUTO_MS = (function () {
+    var m = /[?&]autorefresh=(\d+)/.exec(location.search || "");
+    var sec = m ? parseInt(m[1], 10) : 60;
+    if (!(sec >= 5)) sec = 60;
+    if (sec > 3600) sec = 3600;
+    return sec * 1000;
+  })();
+
+  /* ---------------- 基础 ---------------- */
+  function api(path, opts) {
+    opts = opts || {};
+    return fetch(path, {
+      method: opts.method || "GET",
+      headers: { "Content-Type": "application/json" },
+      body: opts.body ? JSON.stringify(opts.body) : undefined
+    }).then(function (r) {
+      return r.json().then(function (j) {
+        if (!r.ok || j.ok === false) throw new Error(j.error || ("HTTP " + r.status));
+        return j;
+      });
+    });
+  }
+
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function showBanner(id, msg) {
+    var el = $(id);
+    if (!msg) { el.classList.add("hidden"); return; }
+    el.textContent = msg;
+    el.classList.remove("hidden");
+  }
+
+  function fmtTime(ts) {
+    if (!ts) return "-";
+    var d = new Date(ts * 1000);
+    var p = function (n) { return (n < 10 ? "0" : "") + n; };
+    return p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " +
+           p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+  }
+
+  function fmtClock(ts) {
+    if (!ts) return "--:--:--";
+    var d = new Date(ts * 1000);
+    var p = function (n) { return (n < 10 ? "0" : "") + n; };
+    return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+  }
+
+  /* ---------------- 总览 ----------------
+     静默刷新（opts.silent）不清空表格、不显示「加载中」，
+     配合 renderContainers 的指纹比对，没变化就一个像素都不动。
+     这样 60 秒自动刷一次时页面不会「跳一下」。 */
+  function loadOverview(opts) {
+    var silent = !!(opts && opts.silent);
+    var hasData = state.containers.length > 0;
+    if (!silent && !hasData) {
+      showBanner("errBanner", "");
+      $("ctBody").innerHTML = '<tr><td colspan="8" class="empty">加载中…</td></tr>';
+    }
+    return api("/api/overview").then(function (j) {
+      var d = j.data || {};
+      state.containers = d.containers || [];
+      var cfg = d.config || {};
+      var srv = (d.server && d.server.overview) || {};
+
+      $("connInfo").textContent =
+        (cfg.router_url || "未配置") + " · 账号 " + (cfg.username || "-") +
+        " · Docker " + (srv.docker_version || "?") +
+        " · " + (srv.status === 1 ? "服务运行中" : "服务已停止");
+      $("verInfo").textContent = "v" + (cfg.version || "?") +
+        " · 加速源 " + (cfg.registries || []).join(" / ");
+      // 干跑开关只在首次加载时从服务端同步，避免 60 秒轮询覆盖用户的选择
+      if (!state.inited) {
+        $("dryRun").checked = !!cfg.dry_run;
+        state.inited = true;
+      }
+
+      if (!cfg.router_url) {
+        showBanner("cfgBanner", "⚠ 尚未配置爱快地址。请给容器设置环境变量 IKUAI_URL / IKUAI_USER / IKUAI_PASS 后重启容器。");
+      } else if (!cfg.password_set) {
+        showBanner("cfgBanner", "⚠ 未配置登录密码（IKUAI_PASS），无法读取容器。");
+      } else {
+        showBanner("cfgBanner", "");
+      }
+
+      $("ctCount").textContent = state.containers.length;
+      $("imageCount").textContent = "本地镜像 " + (d.images_count || 0) + " 个";
+      state.mirrors = d.mirrors || [];
+
+      // 恢复上次检测结果，刷新页面后上游状态不丢
+      var ck = d.check || {};
+      state.checkMap = {};
+      var items = ck.items || {};
+      Object.keys(items).forEach(function (k) { state.checkMap[k] = items[k].status; });
+      state.checkAt = ck.at_str || "";
+      $("checkTime").textContent = state.checkAt ? ("上次检测 " + state.checkAt.slice(5)) : "尚未检测";
+
+      renderContainers();
+      renderHistory(d.history || []);
+      applySettings(d.settings || {});
+
+      state.lastRefresh = Date.now() / 1000;
+      $("lastRefresh").textContent = "刷新于 " + fmtClock(state.lastRefresh);
+    }).catch(function (e) {
+      showBanner("errBanner", "读取失败：" + e.message);
+      // 已有数据时保留旧表格，只挂红条提示，避免一次网络抖动就把列表清空
+      if (!state.containers.length) {
+        $("ctBody").innerHTML = '<tr><td colspan="8" class="empty">读取失败</td></tr>';
+      }
+    });
+  }
+
+  function renderContainers() {
+    var tb = $("ctBody");
+    var html;
+    if (!state.containers.length) {
+      html = '<tr><td colspan="8" class="empty">没有容器（或 Docker 服务未启动）</td></tr>';
+    } else {
+      html = state.containers.map(function (c) {
+        var key = (c.repo || "") + ":" + (c.tag || "");
+        var st = state.checkMap[key] || "unknown";
+        var badge = { newer: ["newer", "⬆ 有新版本"], latest: ["latest", "已是最新"],
+                      failed: ["failed", "查询失败"], running: ["running", "更新中"] }[st]
+                    || ["", "未检测"];
+        var running = String(c.state) === "running";
+        var led = running ? "up" : "down";
+        return '' +
+          '<tr data-name="' + esc(c.name) + '">' +
+            '<td class="cb"><input type="checkbox" class="ct-pick" data-name="' + esc(c.name) + '"' +
+              (state.selected[c.name] ? " checked" : "") + '></td>' +
+            '<td><div class="ct-name">' + esc(c.name) + '</div>' +
+              '<div class="ct-sub">' + esc(c.id ? c.id.slice(0, 12) : "") + '</div></td>' +
+            '<td><div class="mono">' + esc(c.repo) + '</div>' +
+              '<div class="ct-sub">' + esc(c.tag) + '</div></td>' +
+            '<td><span class="dot-led"><i class="led ' + led + '"></i>' +
+              esc(shortStatus(c.status)) + '</span></td>' +
+            '<td class="mono">' + esc(c.ipaddr || "-") + '</td>' +
+            '<td class="mono">' + localPulledCell(c) + '</td>' +
+            '<td><span class="badge ' + badge[0] + '" title="' +
+              esc(state.checkAt ? ("检测于 " + state.checkAt) : "尚未检测") + '">' +
+              badge[1] + '</span></td>' +
+            '<td class="r">' +
+              '<button class="btn tiny ghost ct-tag" data-name="' + esc(c.name) + '" ' +
+                'data-repo="' + esc(c.repo) + '" data-tag="' + esc(c.tag) + '">版本</button> ' +
+              '<button class="btn tiny ct-upd" data-name="' + esc(c.name) + '">更新</button>' +
+            '</td>' +
+          '</tr>';
+      }).join("");
+    }
+    // 内容一模一样就不碰 DOM：省掉整表重排造成的闪动，也保住鼠标悬停/焦点
+    if (html === state.ctSig) return;
+    state.ctSig = html;
+    tb.innerHTML = html;
+    bindRows();
+    updateSelCount();
+  }
+
+  function shortStatus(s) {
+    s = String(s || "");
+    if (/^Up /.test(s)) return s.replace(/\(healthy\)/, "· 健康");
+    return s || "未知";
+  }
+
+  // 本地镜像时间。爱快对「导入/引用」而来的镜像没有拉取记录（install=0），
+  // 后端会退回镜像构建时间并标记 src=build，这里如实标注，不要谎报成「未安装」。
+  function localPulledCell(c) {
+    if (!c.local_pulled) return '<span class="muted">—</span>';
+    if (c.local_pulled_src === "build") {
+      return '<span class="muted" title="爱快无拉取记录（镜像由导入或引用而来），此处为镜像构建时间">' +
+             esc(c.local_pulled) + '</span>';
+    }
+    return esc(c.local_pulled);
+  }
+
+  function bindRows() {
+    Array.prototype.forEach.call(document.querySelectorAll(".ct-pick"), function (cb) {
+      cb.addEventListener("change", function () {
+        state.selected[cb.dataset.name] = cb.checked;
+        updateSelCount();
+      });
+    });
+    Array.prototype.forEach.call(document.querySelectorAll(".ct-upd"), function (b) {
+      b.addEventListener("click", function () { startUpdate([b.dataset.name]); });
+    });
+    Array.prototype.forEach.call(document.querySelectorAll(".ct-tag"), function (b) {
+      b.addEventListener("click", function () { openTagModal(b.dataset.name, b.dataset.repo, b.dataset.tag); });
+    });
+  }
+
+  function updateSelCount() {
+    var n = Object.keys(state.selected).filter(function (k) { return state.selected[k]; }).length;
+    var btn = $("btnUpdateSelected");
+    btn.disabled = n === 0;
+    btn.textContent = n ? ("更新选中 (" + n + ")") : "更新选中";
+  }
+
+  /* ---------------- 执行面板 ---------------- */
+  function openExec(title, flow) {
+    autoYieldToJob();          // 开面板即视为开始跑任务，自动刷新先让路
+    state.flow = flow || STEP_ORDER.map(function (k) { return { key: k, state: "pending", message: "" }; });
+    state.progress = { current: 0, total: 1 };
+    $("execPanel").classList.remove("hidden");
+    $("execTitle").textContent = title;
+    $("execCounter").textContent = "";
+    $("execBar").style.width = "0%";
+    $("execSpinner").className = "spinner";
+    state.logs = [];
+    $("log").innerHTML = "";
+    renderFlow();
+  }
+
+  function renderFlow() {
+    var ol = $("flow");
+    ol.innerHTML = state.flow.map(function (s, i) {
+      var st = s.state || "pending";
+      // 运行中转圈；完成打勾；失败叉号；跳过用短横；其余显示序号
+      var inner = st === "running"
+        ? '<span class="mini-spin"></span>'
+        : (st === "done" ? "✓" : (st === "failed" ? "✕" : (st === "skipped" ? "–" : (i + 1))));
+      return '' +
+        '<li class="step ' + st + '" data-key="' + esc(s.key) + '">' +
+          '<div class="fdot">' + inner + '</div>' +
+          '<div class="ftxt">' +
+            '<div class="fname">' + esc(s.name || s.key) + '</div>' +
+            '<div class="fdesc">' + esc(s.desc || "") + '</div>' +
+            (s.message ? '<div class="fmsg">' + esc(s.message) + '</div>' : '') +
+          '</div>' +
+        '</li>';
+    }).join("");
+  }
+
+  function setStep(key, st, message) {
+    var found = null;
+    state.flow.forEach(function (s) { if (s.key === key) found = s; });
+    if (!found) return;
+    found.state = st;
+    if (message != null) found.message = message;
+    renderFlow();
+    // 跳过也算已走过，进度条才拉得满
+    var done = state.flow.filter(function (s) {
+      return s.state === "done" || s.state === "skipped";
+    }).length;
+    var frac = done / Math.max(state.flow.length, 1);
+    var p = state.progress;
+    var pct = p.total > 1
+      ? Math.round(((p.current - 1) + frac) / p.total * 100)
+      : Math.round(frac * 100);
+    $("execBar").style.width = Math.min(pct, 100) + "%";
+  }
+
+  function logVisible(ev) {
+    return showDebugOn() || (ev.level || "info") !== "debug";
+  }
+
+  function showDebugOn() {
+    var el = $("showDebug");
+    return !!(el && el.checked);
+  }
+
+  function logLineNode(ev) {
+    var lv = ev.level || "info";
+    var cls = lv === "error" ? "lv-error" : lv === "warn" ? "lv-warn"
+            : lv === "debug" ? "lv-debug" : lv === "plain" ? "lv-plain" : "lv-info";
+    var line = document.createElement("span");
+    line.className = "ln";
+    var t = document.createElement("span");
+    t.className = "t";
+    t.textContent = fmtTime(ev.ts).slice(6);
+    var m = document.createElement("span");
+    m.className = cls;
+    m.textContent = ev.message;
+    line.appendChild(t);
+    line.appendChild(m);
+    return line;
+  }
+
+  function appendLog(ev) {
+    state.logs.push(ev);
+    var trimmed = false;
+    while (state.logs.length > 800) { state.logs.shift(); trimmed = true; }
+    var log = $("log");
+    // 行数被裁剪过就整体重绘，保证 DOM 与数据一致
+    if (trimmed) { renderLog(); return; }
+    if (!logVisible(ev)) return;
+    log.appendChild(logLineNode(ev));
+    if ($("autoScroll").checked) log.scrollTop = log.scrollHeight;
+  }
+
+  function renderLog() {
+    var log = $("log");
+    log.innerHTML = "";
+    state.logs.filter(logVisible).forEach(function (ev) { log.appendChild(logLineNode(ev)); });
+    if ($("autoScroll").checked) log.scrollTop = log.scrollHeight;
+  }
+
+  /* ---------------- 自动刷新 ----------------
+     60 秒一轮的定时刷新，随时可以暂停（按钮即可，偏好记在 localStorage）。
+     执行任务期间自动让路、跑完再续上；切到后台标签页时顺延不刷。 */
+  function autoLabelText() {
+    if (!state.auto) return "已暂停";
+    if (state.busy || state.source) return "执行中…";
+    var left = state.nextAt ? Math.round((state.nextAt - Date.now()) / 1000) : AUTO_MS / 1000;
+    return "自动刷新 " + (left > 0 ? left : 0) + "s";
+  }
+
+  function paintAuto() {
+    var btn = $("btnAuto");
+    btn.classList.toggle("off", !state.auto);
+    $("autoLabel").textContent = autoLabelText();
+    btn.title = state.auto
+      ? "每 " + (AUTO_MS / 1000) + " 秒自动刷新一次列表（执行任务时会自动让路）；点一下暂停"
+      : "自动刷新已暂停，点一下恢复";
+  }
+
+  function autoClear() {
+    if (state.autoTimer) { clearTimeout(state.autoTimer); state.autoTimer = null; }
+    state.nextAt = 0;
+  }
+
+  function scheduleAuto(delay) {
+    autoClear();
+    // 关闭 / 有任务在跑：不排下一轮。任务结束时会再调一次，不会漏刷新。
+    if (!state.auto || state.busy || state.source) { paintAuto(); return; }
+    var wait = delay || AUTO_MS;
+    state.nextAt = Date.now() + wait;
+    paintAuto();
+    state.autoTimer = setTimeout(function () {
+      state.autoTimer = null;
+      if (!state.auto || state.busy || state.source) { paintAuto(); return; }
+      if (document.hidden) { scheduleAuto(); return; }      // 后台标签页顺延，回来再刷
+      loadOverview({ silent: true }).then(function () { scheduleAuto(); });
+    }, wait);
+  }
+
+  function setAuto(on) {
+    state.auto = !!on;
+    try { localStorage.setItem("ikuai_auto_refresh", state.auto ? "1" : "0"); } catch (e) {}
+    scheduleAuto();
+  }
+
+  // 开始跑任务时把自动刷新让出去
+  function autoYieldToJob() {
+    state.busy = true;
+    autoClear();
+    paintAuto();
+  }
+
+  /* ---------------- SSE ---------------- */
+  function connect(jobId) {
+    if (state.source) { state.source.close(); state.source = null; }
+    var es = new EventSource("/api/jobs/" + jobId + "/stream");
+    state.source = es;
+
+    es.addEventListener("snapshot", function (e) {
+      var d = JSON.parse(e.data);
+      if (d.steps && d.steps.length) { state.flow = d.steps; renderFlow(); }
+      if (d.targets && d.targets.length && d.kind === "update") {
+        state.progress.total = d.targets.length;
+      }
+      $("execCounter").textContent = (d.kind === "update" ? "更新 " : "检测 ") +
+        (d.targets || []).join("、");
+    });
+
+    es.addEventListener("progress", function (e) {
+      var d = JSON.parse(e.data);
+      state.progress.current = d.current;
+      state.progress.total = d.total;
+      $("execCounter").textContent = "[" + d.current + "/" + d.total + "] " + d.container;
+      // 进入新容器时重置流程图
+      state.flow = state.flow.map(function (s) {
+        return { key: s.key, name: s.name, desc: s.desc, state: "pending", message: "" };
+      });
+      renderFlow();
+    });
+
+    es.addEventListener("step", function (e) {
+      var d = JSON.parse(e.data);
+      setStep(d.key, d.state, d.message);
+    });
+
+    es.addEventListener("log", function (e) { appendLog(JSON.parse(e.data)); });
+
+    es.addEventListener("check_result", function (e) {
+      var d = JSON.parse(e.data);
+      (d.results || []).forEach(function (r) { state.checkMap[r.image] = r.status; });
+      renderContainers();
+    });
+
+    es.addEventListener("done", function (e) {
+      var d = JSON.parse(e.data);
+      $("execSpinner").className = "spinner " + (d.ok ? "done" : "failed");
+      $("execTitle").textContent = d.ok ? "执行完成" : "执行失败";
+      $("execBar").style.width = d.ok ? "100%" : $("execBar").style.width;
+      appendLog({ ts: Date.now() / 1000, level: d.ok ? "ok" : "error",
+                  message: (d.ok ? "✅ " : "❌ ") + (d.message || "") });
+      es.close();
+      state.source = null;
+      state.busy = false;
+      loadHistory();
+      setTimeout(function () {
+        loadOverview({ silent: true }).then(function () { scheduleAuto(); });
+      }, 1200);
+    });
+
+    es.onerror = function () {
+      // 服务端流正常结束或临时断线：已结束就关闭，否则让浏览器自动重连
+      if (es.readyState === 2) {
+        state.source = null;
+        state.busy = false;         // 流断了也别把自动刷新一直卡住
+        scheduleAuto();
+      }
+    };
+  }
+
+  /* ---------------- 触发任务 ---------------- */
+  function startUpdate(names) {
+    if (!names || !names.length) return;
+    openExec("正在更新容器", null);
+    appendLog({ ts: Date.now() / 1000, level: "info",
+                message: "提交更新请求：" + names.join("、") + "（干跑：" + ($("dryRun").checked ? "开" : "关") + "）" });
+    api("/api/update", {
+      method: "POST",
+      body: { containers: names, dry_run: $("dryRun").checked }
+    }).then(function (j) {
+      connect(j.job_id);
+    }).catch(function (e) {
+      appendLog({ ts: Date.now() / 1000, level: "error", message: "提交失败：" + e.message });
+      $("execSpinner").className = "spinner failed";
+      $("execTitle").textContent = "提交失败";
+      state.busy = false;          // 没跑起来，自动刷新照常继续
+      scheduleAuto();
+    });
+  }
+
+  function startCheck() {
+    openExec("正在检测上游版本", null);
+    appendLog({ ts: Date.now() / 1000, level: "info", message: "开始检测所有容器的上游镜像版本…" });
+    api("/api/check", { method: "POST", body: {} }).then(function (j) {
+      connect(j.job_id);
+    }).catch(function (e) {
+      appendLog({ ts: Date.now() / 1000, level: "error", message: "提交失败：" + e.message });
+      $("execSpinner").className = "spinner failed";
+      $("execTitle").textContent = "提交失败";
+      state.busy = false;          // 没跑起来，自动刷新照常继续
+      scheduleAuto();
+    });
+  }
+
+  /* ---------------- 版本弹窗 ---------------- */
+  function openTagModal(name, repo, tag) {
+    state.target = { name: name, repo: repo, tag: tag, picked: "" };
+    $("tagTitle").textContent = name + " · 选择版本";
+    $("tagBody").innerHTML = '<div class="muted">正在查询 ' + esc(repo) + ' 的可用版本…</div>';
+    $("tagModal").classList.remove("hidden");
+    api("/api/tags?image=" + encodeURIComponent(repo)).then(function (j) {
+      var tags = j.data || [];
+      if (!tags.length) { $("tagBody").innerHTML = '<div class="muted">没查到版本列表</div>'; return; }
+      $("tagBody").innerHTML = '<div class="muted" style="margin-bottom:10px">当前：<b>' +
+        esc(tag) + '</b> · 共 ' + tags.length + ' 个版本，点击选择</div><div class="tag-grid">' +
+        tags.map(function (t) {
+          return '<span class="tag-chip" data-tag="' + esc(t) + '">' + esc(t) + '</span>';
+        }).join("") + '</div>';
+      Array.prototype.forEach.call(document.querySelectorAll(".tag-chip"), function (c) {
+        c.addEventListener("click", function () {
+          Array.prototype.forEach.call(document.querySelectorAll(".tag-chip"),
+            function (x) { x.classList.remove("on"); });
+          c.classList.add("on");
+          state.target.picked = c.dataset.tag;
+        });
+      });
+    }).catch(function (e) {
+      $("tagBody").innerHTML = '<div class="muted">查询失败：' + esc(e.message) + '</div>';
+    });
+  }
+
+  /* ---------------- 设置与定时任务 ---------------- */
+  function fmtDuration(sec) {
+    sec = Math.max(0, Math.round(sec || 0));
+    if (sec < 60) return sec + " 秒";
+    var m = Math.floor(sec / 60), s = sec % 60;
+    if (m < 60) return m + " 分钟" + (s ? " " + s + " 秒" : "");
+    var h = Math.floor(m / 60), mm = m % 60;
+    return h + " 小时" + (mm ? " " + mm + " 分" : "");
+  }
+
+  function applySettings(s) {
+    if (s && (s.schedules || s.pull_timeout != null)) state.settings = s;
+    var t = (state.settings || {}).pull_timeout;
+    if (t) {
+      $("scTimeout").textContent = "下载超时 " + fmtDuration(t) +
+        ($("dryRun").checked ? " · 干跑中改不了真容器" : "");
+      if (!state.setInited) { $("setTimeout").value = t; state.setInited = true; }
+    }
+    renderSchedules();
+  }
+
+  function renderSchedules() {
+    var list = (state.settings || {}).schedules || [];
+    $("scCount").textContent = list.length;
+    var tb = $("scBody");
+    if (!list.length) {
+      tb.innerHTML = '<tr><td colspan="8" class="empty">暂无定时任务，点右上角「新建定时任务」</td></tr>';
+      return;
+    }
+    tb.innerHTML = list.map(function (s) {
+      var modeBadge = s.mode === "update"
+        ? '<span class="badge auto">自动更新</span>'
+        : '<span class="badge gray">仅检测</span>';
+      var targets = (s.mode === "check" && !(s.targets || []).length)
+        ? '<span class="muted">全部容器</span>'
+        : esc((s.targets || []).join("、"));
+      return '<tr>' +
+        '<td><div class="ct-name">' + esc(s.name) + '</div>' +
+          '<div class="ct-sub">' + esc(s.id) + '</div></td>' +
+        '<td>' + modeBadge + '</td>' +
+        '<td>' + targets + '</td>' +
+        '<td>' + esc(s.frequency || "") + '</td>' +
+        '<td class="mono">' + esc(nextRunText(s)) + '</td>' +
+        '<td>' + lastResultCell(s) + '</td>' +
+        '<td><label class="mini-switch"><input type="checkbox" class="sc-toggle" data-id="' +
+          esc(s.id) + '"' + (s.enabled ? " checked" : "") + '></label></td>' +
+        '<td class="r">' +
+          '<button class="btn tiny sc-run" data-id="' + esc(s.id) + '">立即执行</button> ' +
+          '<button class="btn tiny ghost sc-edit" data-id="' + esc(s.id) + '">编辑</button> ' +
+          '<button class="btn tiny ghost sc-del" data-id="' + esc(s.id) + '">删除</button>' +
+        '</td>' +
+      '</tr>';
+    }).join("");
+    bindScheduleRows();
+  }
+
+  function nextRunText(s) {
+    if (!s.enabled) return "已停用";
+    if (!s.next_run) return "—";
+    var diff = s.next_run - Date.now() / 1000;
+    return fmtTime(s.next_run) + " · " + (diff <= 5 ? "即将执行" : ("约 " + fmtDuration(diff) + "后"));
+  }
+
+  function lastResultCell(s) {
+    var map = { ok: ["latest", "已完成"], fail: ["failed", "失败"],
+                skip: ["gray", "已跳过"], running: ["running", "执行中"] };
+    var m = map[s.last_status];
+    if (!m) return '<span class="muted">—</span>';
+    var t = s.last_run ? fmtTime(s.last_run).slice(5) : "";
+    return '<span class="badge ' + m[0] + '" title="' + esc(s.last_message || "") + '">' +
+           m[1] + '</span> <span class="muted">' + esc(t) + '</span>';
+  }
+
+  function bindScheduleRows() {
+    Array.prototype.forEach.call(document.querySelectorAll(".sc-toggle"), function (cb) {
+      cb.addEventListener("change", function () {
+        var on = cb.checked;
+        api("/api/schedules", { method: "POST",
+          body: { action: "toggle", id: cb.dataset.id, enabled: on } })
+          .then(function (j) { applySettings(j.data); })
+          .catch(function (e) { cb.checked = !on; alert("操作失败：" + e.message); });
+      });
+    });
+    Array.prototype.forEach.call(document.querySelectorAll(".sc-run"), function (b) {
+      b.addEventListener("click", function () { runScheduleNow(b.dataset.id, b); });
+    });
+    Array.prototype.forEach.call(document.querySelectorAll(".sc-edit"), function (b) {
+      b.addEventListener("click", function () {
+        var s = findSchedule(b.dataset.id);
+        if (s) openSchedule(s);
+      });
+    });
+    Array.prototype.forEach.call(document.querySelectorAll(".sc-del"), function (b) {
+      b.addEventListener("click", function () {
+        var s = findSchedule(b.dataset.id);
+        if (!s || !confirm("确定删除定时任务「" + s.name + "」？")) return;
+        api("/api/schedules", { method: "POST", body: { action: "delete", id: s.id } })
+          .then(function (j) { applySettings(j.data); })
+          .catch(function (e) { alert("删除失败：" + e.message); });
+      });
+    });
+  }
+
+  function findSchedule(id) {
+    var list = (state.settings || {}).schedules || [];
+    for (var i = 0; i < list.length; i++) { if (list[i].id === id) return list[i]; }
+    return null;
+  }
+
+  function runScheduleNow(id, btn) {
+    if (btn) { btn.disabled = true; setTimeout(function () { btn.disabled = false; }, 2500); }
+    api("/api/schedules", { method: "POST", body: { action: "run", id: id } })
+      .then(function (j) {
+        applySettings(j.data);
+        if (j.data.job_id) {
+          var s = findSchedule(id);
+          openExec("定时任务 · " + ((s && s.name) || "立即执行"), null);
+          connect(j.data.job_id);
+        }
+      })
+      .catch(function (e) { alert("执行失败：" + e.message); });
+  }
+
+  /* ---------------- 定时任务弹窗 ---------------- */
+  function openSchedule(item) {
+    state.scEdit = item || null;
+    state.scMode = (item && item.mode) || "check";
+    state.scFreq = (!item || (item.every || 0) > 0) ? "every" : "daily";
+    $("scTitle").textContent = item ? ("编辑定时任务 · " + item.name) : "新建定时任务";
+    $("scName").value = item ? item.name : "";
+    $("scEvery").value = (item && item.every) ? item.every : 360;
+    $("scAt").value = (item && item.at) || "03:30";
+    $("scTag").value = (item && item.tag) || "";
+    setSeg("scMode", "data-mode", state.scMode);
+    setSeg("scFreq", "data-freq", state.scFreq);
+    renderTargetPicker(item ? item.targets : []);
+    syncFreqVisibility();
+    warnSc("");
+    $("scFoot").textContent = item ? "保存后重新排期" : "保存后立即开始按频率运行";
+    $("scModal").classList.remove("hidden");
+  }
+
+  function setSeg(boxId, attr, value) {
+    Array.prototype.forEach.call($(boxId).querySelectorAll(".seg-item"), function (x) {
+      x.classList.toggle("on", x.getAttribute(attr) === value);
+    });
+  }
+
+  function bindSeg(boxId, onChange) {
+    var box = $(boxId);
+    box.addEventListener("click", function (e) {
+      var btn = e.target;
+      while (btn && btn !== box && !btn.classList.contains("seg-item")) btn = btn.parentNode;
+      if (!btn || btn === box) return;
+      Array.prototype.forEach.call(box.querySelectorAll(".seg-item"), function (x) {
+        x.classList.toggle("on", x === btn);
+      });
+      onChange(btn);
+    });
+  }
+
+  function renderTargetPicker(selected) {
+    var sel = {};
+    (selected || []).forEach(function (n) { sel[n] = true; });
+    var list = state.containers || [];
+    $("scTargets").innerHTML = list.length
+      ? list.map(function (c) {
+          return '<label class="pick-item"><input type="checkbox" class="sc-target" value="' +
+            esc(c.name) + '"' + (sel[c.name] ? " checked" : "") + '><span title="' +
+            esc(c.repo + ":" + c.tag) + '">' + esc(c.name) + '</span></label>';
+        }).join("")
+      : '<div class="muted">没读到容器（先确认爱快连接正常）</div>';
+    Array.prototype.forEach.call(document.querySelectorAll(".sc-target"), function (cb) {
+      cb.addEventListener("change", syncTargetHint);
+    });
+    syncTargetHint();
+  }
+
+  function syncTargetHint() {
+    var n = pickedTargets().length;
+    $("scTargetHint").textContent = n ? ("已选 " + n + " 个") : "未选 = 全部容器";
+  }
+
+  function pickedTargets() {
+    return Array.prototype.filter.call(document.querySelectorAll(".sc-target"), function (x) {
+      return x.checked;
+    }).map(function (x) { return x.value; });
+  }
+
+  function syncFreqVisibility() {
+    $("freqEvery").classList.toggle("hidden", state.scFreq !== "every");
+    $("scEveryQuick").classList.toggle("hidden", state.scFreq !== "every");
+    $("freqDaily").classList.toggle("hidden", state.scFreq !== "daily");
+  }
+
+  function warnSc(msg) {
+    var el = $("scWarn");
+    if (!msg) { el.classList.add("hidden"); el.textContent = ""; return; }
+    el.textContent = msg;
+    el.classList.remove("hidden");
+  }
+
+  function saveSchedule() {
+    var mode = state.scMode;
+    var targets = pickedTargets();
+    if (mode === "update" && !targets.length) {
+      warnSc("「检测到新版就更新」必须至少选择一个目标容器，否则不知道该更新谁。");
+      return;
+    }
+    var every = 0;
+    if (state.scFreq === "every") {
+      every = parseInt($("scEvery").value, 10) || 0;
+      if (every < 5) { warnSc("间隔不能小于 5 分钟，避免把加速源打爆。"); return; }
+    }
+    var payload = {
+      id: state.scEdit ? state.scEdit.id : "",
+      name: ($("scName").value || "").trim() ||
+            (mode === "update" ? "自动更新任务" : "版本检测任务"),
+      mode: mode,
+      targets: targets,
+      every: every,
+      at: $("scAt").value || "03:30",
+      tag: ($("scTag").value || "").trim(),
+      enabled: state.scEdit ? state.scEdit.enabled : true
+    };
+    api("/api/schedules", { method: "POST", body: { action: "save", item: payload } })
+      .then(function (j) { applySettings(j.data); $("scModal").classList.add("hidden"); })
+      .catch(function (e) { warnSc("保存失败：" + e.message); });
+  }
+
+  /* ---------------- 设置弹窗 ---------------- */
+  function openSettings() {
+    var s = state.settings || {};
+    var t = s.pull_timeout || 900;
+    $("setTimeout").value = t;
+    $("setFoot").textContent = "可填 " + (s.pull_timeout_min || 60) +
+      " ~ " + (s.pull_timeout_max || 7200) + " 秒";
+    renderQuick($("setTimeoutQuick"),
+      (s.suggested_timeouts || [600, 1800, 3600]).map(function (v) {
+        return { v: v, label: fmtDuration(v) };
+      }),
+      function (v) { $("setTimeout").value = v; });
+    $("setModal").classList.remove("hidden");
+  }
+
+  function renderQuick(box, items, onPick) {
+    box.innerHTML = items.map(function (it) {
+      return '<span class="quick" data-v="' + it.v + '">' + esc(it.label) + '</span>';
+    }).join("");
+    Array.prototype.forEach.call(box.querySelectorAll(".quick"), function (q) {
+      q.addEventListener("click", function () { onPick(parseInt(q.dataset.v, 10)); });
+    });
+  }
+
+  function saveSettings() {
+    var v = parseInt($("setTimeout").value, 10);
+    api("/api/settings", { method: "POST", body: { pull_timeout: v } })
+      .then(function (j) {
+        applySettings(j.data);
+        state.setInited = false;
+        $("setModal").classList.add("hidden");
+      })
+      .catch(function (e) { alert("保存失败：" + e.message); });
+  }
+
+  /* ---------------- 历史 ---------------- */
+  function renderHistory(list) {
+    var el = $("history");
+    var html;
+    if (!list || !list.length) {
+      html = '<div class="empty">暂无记录</div>';
+    } else {
+      html = list.map(function (h) {
+        var ok = h.ok;
+        var failedStep = (h.steps || []).filter(function (s) { return s.state === "failed"; })[0];
+        var n = h.log_count || 0;
+        return '<div class="hrow">' +
+          '<span class="badge ' + (ok ? "latest" : "failed") + '">' + (ok ? "成功" : "失败") + '</span>' +
+          '<span class="htime">' + esc(fmtTime(h.finished_at || h.created)) + '</span>' +
+          '<span class="htarget">' + esc((h.targets || []).join("、") || (h.kind === "check" ? "版本检测" : "-")) + '</span>' +
+          '<span class="hmsg">' + esc(failedStep ? (failedStep.name + "：" + (failedStep.message || "")) : "") + '</span>' +
+          '<button class="btn tiny ghost hlog" data-id="' + esc(h.id) + '"' +
+            (n ? "" : " disabled") + '>日志' + (n ? " " + n : "") + '</button>' +
+          '</div>';
+      }).join("");
+    }
+    if (html === state.histSig) return;
+    state.histSig = html;
+    el.innerHTML = html;
+    Array.prototype.forEach.call(el.querySelectorAll(".hlog"), function (b) {
+      b.addEventListener("click", function () { openLog(b.getAttribute("data-id")); });
+    });
+  }
+
+  /* ---------------- 历史日志明细 ---------------- */
+  function openLog(id) {
+    $("logBody").innerHTML = '<div class="empty">加载中…</div>';
+    $("logModal").classList.remove("hidden");
+    api("/api/history/" + encodeURIComponent(id)).then(function (j) {
+      var h = j.data || {};
+      var logs = h.logs || [];
+      $("logTitle").textContent = (h.kind === "check" ? "版本检测" : "容器更新") +
+        " · " + ((h.targets || []).join("、") || "全部容器");
+      $("logSub").textContent = fmtTime(h.finished_at || h.created) +
+        " · " + (h.ok ? "成功" : "失败") + " · " + logs.length + " 行日志" +
+        (h.message ? " · " + h.message : "");
+      if (!logs.length) {
+        $("logBody").innerHTML =
+          '<div class="empty">这条记录没有日志明细（可能是本次改动之前产生的旧记录）</div>';
+        return;
+      }
+      $("logBody").innerHTML = logs.map(function (l) {
+        var lv = l.level || "info";
+        var cls = lv === "plain" ? "plain" : (lv === "debug" ? "debug" : lv);
+        return '<div class="lg ' + cls + '">' +
+          '<span class="lg-t">' + esc(fmtClock(l.ts)) + '</span>' +
+          '<span class="lg-m">' + esc(l.message) + '</span></div>';
+      }).join("");
+      $("logBody").scrollTop = 0;
+    }).catch(function (e) {
+      $("logBody").innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>';
+    });
+  }
+
+  function loadHistory() {
+    api("/api/history").then(function (j) { renderHistory(j.data || []); }).catch(function () {});
+  }
+
+  /* ---------------- 事件绑定 ---------------- */
+  $("btnAuto").addEventListener("click", function () { setAuto(!state.auto); });
+  $("btnRefresh").addEventListener("click", function () {
+    // 手动刷新只提前拉一次，并把自动刷新的倒计时重新起算（免得刚点完又被刷一遍）
+    loadOverview().then(function () { if (state.auto) scheduleAuto(); });
+  });
+  $("btnCheck").addEventListener("click", startCheck);
+  $("btnReloadHist").addEventListener("click", loadHistory);
+  $("btnCloseLog").addEventListener("click", function () {
+    $("logModal").classList.add("hidden");
+  });
+  $("logModal").addEventListener("click", function (e) {
+    if (e.target === this) this.classList.add("hidden");
+  });
+  $("btnLogCopy").addEventListener("click", function () {
+    var btn = this;
+    var lines = Array.prototype.map.call($("logBody").querySelectorAll(".lg"), function (r) {
+      return r.textContent;
+    });
+    var txt = $("logSub").textContent + "\n\n" + lines.join("\n");
+    if (!navigator.clipboard) return;
+    navigator.clipboard.writeText(txt).then(function () {
+      btn.textContent = "已复制";
+      setTimeout(function () { btn.textContent = "复制"; }, 1500);
+    });
+  });
+  $("btnCloseExec").addEventListener("click", function () {
+    $("execPanel").classList.add("hidden");
+  });
+  $("btnClearLog").addEventListener("click", function () {
+    state.logs = [];
+    $("log").innerHTML = "";
+  });
+  $("showDebug").addEventListener("change", function () {
+    try { localStorage.setItem("ikuai_show_debug", this.checked ? "1" : "0"); } catch (e) {}
+    renderLog();
+  });
+  $("btnUpdateSelected").addEventListener("click", function () {
+    var names = Object.keys(state.selected).filter(function (k) { return state.selected[k]; });
+    startUpdate(names);
+  });
+  $("checkAll").addEventListener("change", function () {
+    var on = this.checked;
+    state.containers.forEach(function (c) { state.selected[c.name] = on; });
+    renderContainers();
+  });
+  $("dryRun").addEventListener("change", function () {
+    try { localStorage.setItem("ikuai_dry_run", this.checked ? "1" : "0"); } catch (e) {}
+    applySettings(null);          // 让「下载超时」那行同步提示当前处于干跑
+  });
+  $("btnCloseTag").addEventListener("click", function () { $("tagModal").classList.add("hidden"); });
+  $("btnTagConfirm").addEventListener("click", function () {
+    var t = state.target;
+    if (!t) return;
+    $("tagModal").classList.add("hidden");
+    var tag = t.picked || t.tag;
+    openExec("正在更新容器", null);
+    appendLog({ ts: Date.now() / 1000, level: "info",
+                message: "提交更新请求：" + t.name + " → " + tag });
+    api("/api/update", { method: "POST", body: { containers: [t.name], tag: tag,
+                                                 dry_run: $("dryRun").checked } })
+      .then(function (j) { connect(j.job_id); })
+      .catch(function (e) {
+        appendLog({ ts: Date.now() / 1000, level: "error", message: "提交失败：" + e.message });
+        state.busy = false;
+        scheduleAuto();
+      });
+  });
+  $("lnkRegistries").addEventListener("click", function (e) {
+    e.preventDefault();
+    var src = (state.mirrors || []).slice();
+    if (src.length) {
+      alert("镜像加速源（读取自爱快 Docker 服务设置，按顺序回退）：\n\n" + src.join("\n") +
+            "\n\n镜像由爱快自己下载，改爱快后台这一处即可，本工具自动跟随。");
+      return;
+    }
+    api("/api/config").then(function (j) {
+      alert("没能读到爱快的加速源，当前退回本工具内置源：\n\n" +
+            (j.data.registries || []).join("\n"));
+    });
+  });
+
+  /* ---------------- 设置 / 定时任务 事件 ---------------- */
+  $("btnSettingsTop").addEventListener("click", openSettings);
+  $("btnSettingsPanel").addEventListener("click", openSettings);
+  $("btnCloseSet").addEventListener("click", function () { $("setModal").classList.add("hidden"); });
+  $("btnSetSave").addEventListener("click", saveSettings);
+
+  $("btnNewSchedule").addEventListener("click", function () { openSchedule(null); });
+  $("btnCloseSc").addEventListener("click", function () { $("scModal").classList.add("hidden"); });
+  $("btnScSave").addEventListener("click", saveSchedule);
+  $("scPickAll").addEventListener("click", function () {
+    Array.prototype.forEach.call(document.querySelectorAll(".sc-target"),
+      function (x) { x.checked = true; });
+    syncTargetHint();
+  });
+  $("scPickNone").addEventListener("click", function () {
+    Array.prototype.forEach.call(document.querySelectorAll(".sc-target"),
+      function (x) { x.checked = false; });
+    syncTargetHint();
+  });
+  bindSeg("scMode", function (el) { state.scMode = el.getAttribute("data-mode"); });
+  bindSeg("scFreq", function (el) {
+    state.scFreq = el.getAttribute("data-freq");
+    syncFreqVisibility();
+  });
+  renderQuick($("scEveryQuick"),
+    [{ v: 60, label: "1 小时" }, { v: 360, label: "6 小时" },
+     { v: 720, label: "12 小时" }, { v: 1440, label: "1 天" }],
+    function (v) {
+      $("scEvery").value = v;
+      state.scFreq = "every";
+      setSeg("scFreq", "data-freq", "every");
+      syncFreqVisibility();
+    });
+
+  // 恢复用户偏好
+  try {
+    if (localStorage.getItem("ikuai_dry_run") === "1") $("dryRun").checked = true;
+    if (localStorage.getItem("ikuai_show_debug") === "1") $("showDebug").checked = true;
+    if (localStorage.getItem("ikuai_auto_refresh") === "0") state.auto = false;
+  } catch (e) {}
+
+  // 便捷入口（可收藏为书签）：
+  //   /?autorun=check                      打开即开始版本检测
+  //   /?autorun=update&container=clash&dry=1  预览更新流程（强制干跑，URL 无法触发真实更新）
+  function autorun() {
+    var q = location.search;
+    if (/[?&]autorun=check/.test(q)) { setTimeout(startCheck, 600); return; }
+    if (/[?&]autorun=update/.test(q) && /[?&]dry=1/.test(q)) {
+      var m = /[?&]container=([^&]+)/.exec(q);
+      var names = m ? [decodeURIComponent(m[1])] : [];
+      if (!names.length) return;
+      $("dryRun").checked = true;
+      setTimeout(function () { startUpdate(names); }, 600);
+    }
+  }
+
+  // 自动刷新：先按偏好把开关摆好，再拉首次数据；按钮倒计时每秒走一格
+  setAuto(state.auto);
+  setInterval(paintAuto, 1000);
+
+  // 从后台标签页切回来时，数据太旧就立刻补一次，否则照常等下一轮
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden || !state.auto || state.busy || state.source) return;
+    var stale = state.lastRefresh &&
+                (Date.now() / 1000 - state.lastRefresh) > AUTO_MS / 2000;
+    if (stale) {
+      loadOverview({ silent: true }).then(function () { scheduleAuto(); });
+    } else {
+      scheduleAuto();
+    }
+  });
+
+  loadOverview().then(function () { try { autorun(); } catch (e) {} });
+})();
