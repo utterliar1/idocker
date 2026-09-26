@@ -216,10 +216,16 @@ jobs:
             -e HTTP_TIMEOUT=3 \
             -e AUTH_USER=admin -e AUTH_PASS=ci-pw-only \
             "$IMG"
+          up=0
           for i in $(seq 1 30); do
-            if curl -fsS -o /dev/null "$B/login"; then echo "第 $i 次探活通过"; break; fi
+            if curl -fsS -o /dev/null "$B/login"; then echo "第 $i 次探活通过"; up=1; break; fi
             sleep 2
           done
+          if [ "$up" != "1" ]; then
+            echo "::error::带认证的容器 30 次探活均失败"
+            docker logs smoke-auth 2>&1 | tail -40
+            exit 1
+          fi
 
           echo "--- 登录页要素 ---"
           page=$(curl -fsS "$B/login")
