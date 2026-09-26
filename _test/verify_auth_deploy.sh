@@ -84,6 +84,31 @@ else
     rm -f /tmp/_ck.txt
 fi
 
+say "页面控件（v1.4.0 的概览条 / 一键更新 / 确认框 / 轻提示）"
+# 前端资源漏打是最隐蔽的一类构建事故：页面能开，但新加的控件没了。
+fetch() {
+    if [ -n "$U" ] && [ -n "$P" ]; then
+        curl -sS -u "$U:$P" "$1" 2>/dev/null
+    else
+        curl -sS "$1" 2>/dev/null
+    fi
+}
+HOME_HTML=$(fetch "$B/")
+for want in updBar updStat btnUpdateAll btnCheckInline cfmModal toastWrap; do
+    if echo "$HOME_HTML" | grep -qF "id=\"$want\""; then good "首页有 #$want"
+    else bad "首页缺少 #$want"; fi
+done
+APP_JS=$(fetch "$B/static/app.js")
+for fn in confirmUpdate updatableContainers renderUpdBar maybeAutoCheck; do
+    if echo "$APP_JS" | grep -qF "function $fn"; then good "app.js 有 $fn()"
+    else bad "app.js 缺少 $fn()"; fi
+done
+if fetch "$B/static/style.css" | grep -qF 'prefers-color-scheme: dark'; then
+    good "style.css 带深色主题"
+else
+    bad "style.css 没有深色主题"
+fi
+
 say "数据卷有没有被复用（设置与历史不能丢）"
 echo -n "  挂载的卷: "
 docker inspect idocker --format '{{range .Mounts}}{{.Name}} -> {{.Destination}} {{end}}'
