@@ -18,7 +18,8 @@ ARG APP_VERSION=1.3.3
 LABEL org.opencontainers.image.title="idocker" \
       org.opencontainers.image.description="爱快(iKuai) 4.0 Docker 容器更新器，带可视化执行流程" \
       org.opencontainers.image.version="${APP_VERSION}" \
-      org.opencontainers.image.source="https://github.com/utterliar1/idocker"
+      org.opencontainers.image.source="https://github.com/utterliar1/idocker" \
+      org.opencontainers.image.licenses="MIT"
 
 # tzdata 用于让容器内时间正确显示（装了才能让 TZ 生效）。
 # Alpine 官方源在国内可能很慢，先尝试国内镜像，全部失败也不影响运行。
