@@ -24,6 +24,13 @@
     scEdit: null,        // 正在编辑的定时任务（null = 新建）
     scMode: "check",
     scFreq: "every",
+    // ---- 上游版本检测 ----
+    checkTs: 0,          // 上次检测的时刻（秒），来自服务端持久化的 last_check
+    detecting: false,    // 正在后台静默检测（不弹执行面板）
+    routerReady: false,  // 爱快地址与密码都配好了，才谈得上检测
+    jobKind: "",         // 当前订阅的任务类型（check / update）
+    jobTargets: [],      // 当前任务涉及的容器，收尾提示用
+    autoCheckedAt: 0,    // 上次由「自动检测」发起的时刻（秒），用于节流
     // ---- 自动刷新 ----
     auto: true,          // 自动刷新开关（用户点按钮可暂停）
     busy: false,         // 有任务已提交/正在执行，自动刷新让路
@@ -41,6 +48,17 @@
     var sec = m ? parseInt(m[1], 10) : 60;
     if (!(sec >= 5)) sec = 60;
     if (sec > 3600) sec = 3600;
+    return sec * 1000;
+  })();
+  // 自动版本检测：打开页面时若上次检测结果已过期，就自己跑一次，
+  // 省掉「先点一下检查更新才知道有没有新版」这一步。
+  // ?autocheck=秒 可调（最小 60），?autocheck=0 彻底关闭。
+  var AUTO_CHECK_MS = (function () {
+    var m = /[?&]autocheck=(\d+)/.exec(location.search || "");
+    if (!m) return 600 * 1000;
+    var sec = parseInt(m[1], 10);
+    if (!(sec > 0)) return 0;
+    if (sec < 60) sec = 60;
     return sec * 1000;
   })();
 
@@ -82,6 +100,53 @@
     if (!msg) { el.classList.add("hidden"); return; }
     el.textContent = msg;
     el.classList.remove("hidden");
+  }
+
+  /* ---------------- 轻提示 ----------------
+     右下角堆叠、几秒后自动消失，几秒内重复出现会自动续期而不是刷屏。 */
+  function toast(msg, type, ms) {
+    var wrap = $("toastWrap");
+    if (!wrap || !msg) return;
+    var el = document.createElement("div");
+    el.className = "toast " + (type || "info");
+    el.textContent = msg;
+    wrap.appendChild(el);
+    // 最多同时留 4 条，多了把最老的挤掉，免得糊住半个屏幕
+    while (wrap.childNodes && wrap.childNodes.length > 4) {
+      try { wrap.removeChild(wrap.childNodes[0]); } catch (e) { break; }
+    }
+    setTimeout(function () {
+      try { if (wrap.removeChild) wrap.removeChild(el); } catch (e) { /* 已移除 */ }
+    }, ms || 4200);
+  }
+
+  /* ---------------- 弹窗：确认 / 告知 ----------------
+     不用原生 confirm/alert：一是长得难看，二是批量更新前要列出到底动了谁，
+     原生框根本排不了版。 */
+  var _boxResolve = null;
+
+  function openBox(opts) {
+    return new Promise(function (resolve) {
+      _boxResolve = resolve;
+      $("cfmTitle").textContent = opts.title || "确认操作";
+      $("cfmBody").innerHTML = opts.html || "";
+      $("cfmOk").textContent = opts.okText || "确定";
+      $("cfmOk").className = "btn " + (opts.danger ? "danger" : "primary");
+      $("cfmCancel").classList.toggle("hidden", !!opts.oneButton);
+      $("cfmModal").classList.remove("hidden");
+    });
+  }
+
+  function closeBox(value) {
+    $("cfmModal").classList.add("hidden");
+    var r = _boxResolve;
+    _boxResolve = null;
+    if (r) r(!!value);
+  }
+
+  function confirmBox(opts) { return openBox(opts); }
+  function infoBox(title, html) {
+    return openBox({ title: title, html: html, okText: "知道了", oneButton: true });
   }
 
   function fmtTime(ts) {
@@ -136,10 +201,13 @@
       }
 
       if (!cfg.router_url) {
+        state.routerReady = false;
         showBanner("cfgBanner", "⚠ 尚未配置爱快地址。请给容器设置环境变量 IKUAI_URL / IKUAI_USER / IKUAI_PASS 后重启容器。");
       } else if (!cfg.password_set) {
+        state.routerReady = false;
         showBanner("cfgBanner", "⚠ 未配置登录密码（IKUAI_PASS），无法读取容器。");
       } else {
+        state.routerReady = true;
         showBanner("cfgBanner", "");
       }
 
@@ -152,8 +220,9 @@
       state.checkMap = {};
       var items = ck.items || {};
       Object.keys(items).forEach(function (k) { state.checkMap[k] = items[k].status; });
+      state.checkTs = ck.checked_at || 0;
       state.checkAt = ck.at_str || "";
-      $("checkTime").textContent = state.checkAt ? ("上次检测 " + state.checkAt.slice(5)) : "尚未检测";
+      $("checkTime").textContent = state.checkAt ? ("上次检测 " + state.checkAt.slice(5)) : "";
 
       renderContainers();
       renderHistory(d.history || []);
@@ -161,6 +230,7 @@
 
       state.lastRefresh = Date.now() / 1000;
       $("lastRefresh").textContent = "刷新于 " + fmtClock(state.lastRefresh);
+      maybeAutoCheck();
     }).catch(function (e) {
       showBanner("errBanner", "读取失败：" + e.message);
       // 已有数据时保留旧表格，只挂红条提示，避免一次网络抖动就把列表清空
@@ -170,39 +240,126 @@
     });
   }
 
+  /* ---------------- 上游状态 ---------------- */
+  function checkKey(c) { return (c.repo || "") + ":" + (c.tag || ""); }
+  function checkStatusOf(c) { return state.checkMap[checkKey(c)] || "unknown"; }
+  function updatableContainers() {
+    // 用排好序的列表：一键更新的确认框里，顺序跟表格里看到的一致
+    return sortedContainers().filter(function (c) { return checkStatusOf(c) === "newer"; });
+  }
+
+  // 可更新的排最前，其次运行中的，最后是还没查到状态的；同档按名字排，顺序才稳定
+  function sortedContainers() {
+    var rank = { newer: 0, running: 1 };
+    function r(c) { var v = rank[checkStatusOf(c)]; return v == null ? 2 : v; }
+    return state.containers.slice().sort(function (a, b) {
+      var d = r(a) - r(b);
+      if (d) return d;
+      return String(a.name).localeCompare(String(b.name));
+    });
+  }
+
+  /* 概览条：一眼看到「有没有要更新的、有几个」，并给出一键更新入口。 */
+  function renderUpdBar() {
+    var total = state.containers.length;
+    var newer = 0, latest = 0, failed = 0;
+    state.containers.forEach(function (c) {
+      var k = checkStatusOf(c);
+      if (k === "newer") newer++;
+      else if (k === "latest") latest++;
+      else if (k === "failed") failed++;
+    });
+    var stat = $("updStat"), all = $("btnUpdateAll");
+    if (!stat) return;
+
+    if (state.detecting) {
+      stat.className = "upd-stat busy";
+      stat.textContent = "正在检测上游版本…";
+      all.classList.add("hidden");
+      return;
+    }
+    if (!total) {
+      stat.className = "upd-stat";
+      stat.textContent = "没有容器";
+      all.classList.add("hidden");
+      return;
+    }
+    if (newer) {
+      stat.className = "upd-stat newer";
+      stat.textContent = "⬆ 有 " + newer + " 个容器可以更新" +
+        (failed ? "（另 " + failed + " 个查询失败）" : "");
+      all.textContent = "更新这 " + newer + " 个";
+      all.classList.remove("hidden");
+      return;
+    }
+    all.classList.add("hidden");
+    if (state.checkTs && latest === total) {
+      stat.className = "upd-stat ok";
+      stat.textContent = "✓ 全部 " + total + " 个容器都已是最新";
+      return;
+    }
+    stat.className = "upd-stat";
+    stat.textContent = state.checkTs
+      ? ("未发现新版本" + (total - latest ? "（" + (total - latest) + " 个未确认）" : ""))
+      : "尚未检测上游版本，点右侧「检测版本」看看有没有新版";
+  }
+
+  function setDetecting(on) {
+    state.detecting = !!on;
+    var b1 = $("btnCheck"), b2 = $("btnCheckInline");
+    if (b1) { b1.disabled = !!on; b1.textContent = on ? "检测中…" : "检查更新"; }
+    if (b2) { b2.disabled = !!on; b2.textContent = on ? "检测中…" : "检测版本"; }
+    renderUpdBar();
+  }
+
+  // 上次检测结果过期就自己检测一次。同一阈值同时充当节流：
+  // 页面一直开着也不会漏检，刚失败也不会被反复重试打爆加速源。
+  function maybeAutoCheck() {
+    if (!AUTO_CHECK_MS || !state.routerReady) return;
+    if (state.busy || state.source || state.detecting) return;
+    var now = Date.now() / 1000;
+    if (state.checkTs && (now - state.checkTs) < AUTO_CHECK_MS / 1000) return;
+    if (state.autoCheckedAt && (now - state.autoCheckedAt) < AUTO_CHECK_MS / 1000) return;
+    state.autoCheckedAt = now;
+    setTimeout(function () {
+      if (state.busy || state.source || state.detecting) return;
+      startCheck(true);
+    }, 700);
+  }
+
   function renderContainers() {
     var tb = $("ctBody");
     var html;
     if (!state.containers.length) {
       html = '<tr><td colspan="8" class="empty">没有容器（或 Docker 服务未启动）</td></tr>';
     } else {
-      html = state.containers.map(function (c) {
-        var key = (c.repo || "") + ":" + (c.tag || "");
-        var st = state.checkMap[key] || "unknown";
+      html = sortedContainers().map(function (c) {
+        var st = checkStatusOf(c);
         var badge = { newer: ["newer", "⬆ 有新版本"], latest: ["latest", "已是最新"],
                       failed: ["failed", "查询失败"], running: ["running", "更新中"] }[st]
                     || ["", "未检测"];
         var running = String(c.state) === "running";
         var led = running ? "up" : "down";
         return '' +
-          '<tr data-name="' + esc(c.name) + '">' +
-            '<td class="cb"><input type="checkbox" class="ct-pick" data-name="' + esc(c.name) + '"' +
+          '<tr class="' + (st === "newer" ? "need-upd" : "") + '" data-name="' + esc(c.name) + '">' +
+            '<td class="cb" data-label=""><input type="checkbox" class="ct-pick" data-name="' + esc(c.name) + '"' +
               (state.selected[c.name] ? " checked" : "") + '></td>' +
-            '<td><div class="ct-name">' + esc(c.name) + '</div>' +
+            '<td data-label="容器"><div class="ct-name">' + esc(c.name) + '</div>' +
               '<div class="ct-sub">' + esc(c.id ? c.id.slice(0, 12) : "") + '</div></td>' +
-            '<td><div class="mono">' + esc(c.repo) + '</div>' +
+            '<td data-label="镜像"><div class="mono">' + esc(c.repo) + '</div>' +
               '<div class="ct-sub">' + esc(c.tag) + '</div></td>' +
-            '<td><span class="dot-led"><i class="led ' + led + '"></i>' +
+            '<td data-label="状态"><span class="dot-led"><i class="led ' + led + '"></i>' +
               esc(shortStatus(c.status)) + '</span></td>' +
-            '<td class="mono">' + esc(c.ipaddr || "-") + '</td>' +
-            '<td class="mono">' + localPulledCell(c) + '</td>' +
-            '<td><span class="badge ' + badge[0] + '" title="' +
+            '<td class="mono" data-label="IP">' + esc(c.ipaddr || "-") + '</td>' +
+            '<td class="mono" data-label="镜像拉取于">' + localPulledCell(c) + '</td>' +
+            '<td data-label="上游"><span class="badge ' + badge[0] + '" title="' +
               esc(state.checkAt ? ("检测于 " + state.checkAt) : "尚未检测") + '">' +
               badge[1] + '</span></td>' +
-            '<td class="r">' +
+            '<td class="r ct-acts">' +
               '<button class="btn tiny ghost ct-tag" data-name="' + esc(c.name) + '" ' +
-                'data-repo="' + esc(c.repo) + '" data-tag="' + esc(c.tag) + '">版本</button> ' +
-              '<button class="btn tiny ct-upd" data-name="' + esc(c.name) + '">更新</button>' +
+                'data-repo="' + esc(c.repo) + '" data-tag="' + esc(c.tag) + '">指定版本</button> ' +
+              '<button class="btn tiny' + (st === "newer" ? " primary" : "") +
+                ' ct-upd" data-name="' + esc(c.name) + '">更新</button>' +
             '</td>' +
           '</tr>';
       }).join("");
@@ -213,6 +370,7 @@
     tb.innerHTML = html;
     bindRows();
     updateSelCount();
+    renderUpdBar();
   }
 
   function shortStatus(s) {
@@ -405,14 +563,20 @@
     paintAuto();
   }
 
-  /* ---------------- SSE ---------------- */
-  function connect(jobId) {
+  /* ---------------- SSE ----------------
+     silent = 后台静默任务（自动版本检测）：照常收事件、更新状态，
+     但不碰执行面板，也不打扰正在看页面的人。 */
+  function connect(jobId, silent) {
     if (state.source) { state.source.close(); state.source = null; }
     var es = new EventSource("/api/jobs/" + jobId + "/stream");
     state.source = es;
+    state.jobKind = "";
 
     es.addEventListener("snapshot", function (e) {
       var d = JSON.parse(e.data);
+      state.jobKind = d.kind || "";
+      if (d.targets) state.jobTargets = d.targets.slice();
+      if (silent) return;
       if (d.steps && d.steps.length) { state.flow = d.steps; renderFlow(); }
       if (d.targets && d.targets.length && d.kind === "update") {
         state.progress.total = d.targets.length;
@@ -423,6 +587,7 @@
 
     es.addEventListener("progress", function (e) {
       var d = JSON.parse(e.data);
+      if (silent) return;
       state.progress.current = d.current;
       state.progress.total = d.total;
       $("execCounter").textContent = "[" + d.current + "/" + d.total + "] " + d.container;
@@ -435,10 +600,10 @@
 
     es.addEventListener("step", function (e) {
       var d = JSON.parse(e.data);
-      setStep(d.key, d.state, d.message);
+      if (!silent) setStep(d.key, d.state, d.message);
     });
 
-    es.addEventListener("log", function (e) { appendLog(JSON.parse(e.data)); });
+    es.addEventListener("log", function (e) { if (!silent) appendLog(JSON.parse(e.data)); });
 
     es.addEventListener("check_result", function (e) {
       var d = JSON.parse(e.data);
@@ -448,15 +613,20 @@
 
     es.addEventListener("done", function (e) {
       var d = JSON.parse(e.data);
-      $("execSpinner").className = "spinner " + (d.ok ? "done" : "failed");
-      $("execTitle").textContent = d.ok ? "执行完成" : "执行失败";
-      $("execBar").style.width = d.ok ? "100%" : $("execBar").style.width;
-      appendLog({ ts: Date.now() / 1000, level: d.ok ? "ok" : "error",
-                  message: (d.ok ? "✅ " : "❌ ") + (d.message || "") });
+      var kind = state.jobKind || "check";
+      if (!silent) {
+        $("execSpinner").className = "spinner " + (d.ok ? "done" : "failed");
+        $("execTitle").textContent = d.ok ? "执行完成" : "执行失败";
+        if (d.ok) $("execBar").style.width = "100%";
+        appendLog({ ts: Date.now() / 1000, level: d.ok ? "ok" : "error",
+                    message: (d.ok ? "✅ " : "❌ ") + (d.message || "") });
+      }
       es.close();
       state.source = null;
       state.busy = false;
+      setDetecting(false);
       loadHistory();
+      notifyJobResult(kind, d);
       setTimeout(function () {
         loadOverview({ silent: true }).then(function () { scheduleAuto(); });
       }, 1200);
@@ -467,22 +637,75 @@
       if (es.readyState === 2) {
         state.source = null;
         state.busy = false;         // 流断了也别把自动刷新一直卡住
+        setDetecting(false);
         scheduleAuto();
       }
     };
   }
 
+  // 任务收尾时给一句人话结论 —— 尤其是后台自动检测，用户没盯着看，
+  // 必须主动告诉他「有几个可以更新」。
+  function notifyJobResult(kind, d) {
+    if (kind === "update") {
+      var who = (state.jobTargets || []).join("、");
+      toast(d.ok ? ("更新完成：" + (d.message || who))
+                 : ("更新失败：" + (d.message || "请看执行日志")),
+            d.ok ? "ok" : "error", 7000);
+      return;
+    }
+    var n = updatableContainers().length;
+    if (!d.ok) { toast("版本检测失败：" + (d.message || "请看执行日志"), "error", 7000); return; }
+    toast(n ? ("版本检测完成：有 " + n + " 个容器可以更新")
+            : ("版本检测完成：全部 " + state.containers.length + " 个都已是最新"),
+          n ? "warn" : "ok", 6000);
+  }
+
   /* ---------------- 触发任务 ---------------- */
+  // 更新会重启容器（服务短暂中断），批量之前先让人确认一遍，并列出到底动谁
   function startUpdate(names) {
     if (!names || !names.length) return;
+    if (state.busy || state.source) { toast("已有任务在执行，等它跑完再说", "warn"); return; }
+    confirmUpdate(names, "").then(function (yes) { if (yes) runUpdate(names, ""); });
+  }
+
+  function confirmUpdate(names, tag) {
+    var map = {};
+    state.containers.forEach(function (c) { map[c.name] = c; });
+    var dry = !!$("dryRun").checked;
+    var rows = names.map(function (n) {
+      var c = map[n];
+      var st = c ? checkStatusOf(c) : "unknown";
+      var tail = st === "newer" ? '<span class="badge newer">有新版本</span>'
+               : st === "latest" ? '<span class="badge latest">已是最新</span>' : "";
+      var img = c ? ((c.repo || "") + ":" + (c.tag || "")) : "";
+      return '<li><span class="cfm-nm">' + esc(n) + '</span>' +
+             '<span class="mono cfm-img">' + esc(img) + '</span>' + tail + '</li>';
+    }).join("");
+    return confirmBox({
+      title: dry ? "确认演练更新" : "确认更新容器",
+      html: '<p class="cfm-lead">将' + (dry ? "演练" : "") + '更新以下 <b>' + names.length +
+            '</b> 个容器' + (tag ? '，版本固定为 <b>' + esc(tag) + '</b>' : '') + '：</p>' +
+            '<ul class="cfm-list">' + rows + '</ul>' +
+            '<p class="cfm-note">' + (dry
+              ? "当前是<b>干跑模式</b>：只走一遍流程并打印将要发出的请求，<b>不会真的重启任何容器</b>。"
+              : "过程中这些容器会各<b>重启一次</b>，服务短暂中断（几秒到几十秒，视镜像大小而定）。") +
+            '</p>',
+      okText: dry ? "开始演练" : "开始更新",
+      danger: !dry
+    });
+  }
+
+  function runUpdate(names, tag) {
     openExec("正在更新容器", null);
+    state.jobTargets = names.slice();
     appendLog({ ts: Date.now() / 1000, level: "info",
-                message: "提交更新请求：" + names.join("、") + "（干跑：" + ($("dryRun").checked ? "开" : "关") + "）" });
-    api("/api/update", {
-      method: "POST",
-      body: { containers: names, dry_run: $("dryRun").checked }
-    }).then(function (j) {
-      connect(j.job_id);
+                message: "提交更新请求：" + names.join("、") +
+                         (tag ? (" → " + tag) : "") +
+                         "（干跑：" + ($("dryRun").checked ? "开" : "关") + "）" });
+    var body = { containers: names, dry_run: $("dryRun").checked };
+    if (tag) body.tag = tag;
+    api("/api/update", { method: "POST", body: body }).then(function (j) {
+      connect(j.job_id, false);
     }).catch(function (e) {
       appendLog({ ts: Date.now() / 1000, level: "error", message: "提交失败：" + e.message });
       $("execSpinner").className = "spinner failed";
@@ -492,17 +715,30 @@
     });
   }
 
-  function startCheck() {
-    openExec("正在检测上游版本", null);
-    appendLog({ ts: Date.now() / 1000, level: "info", message: "开始检测所有容器的上游镜像版本…" });
+  // silent = 打开页面时的自动检测：不弹执行面板，只在概览条上转一圈
+  function startCheck(silent) {
+    silent = !!silent;
+    if (state.busy || state.source || state.detecting) {
+      if (!silent) toast("已有任务在执行，等它跑完再说", "warn");
+      return;
+    }
+    if (silent) {
+      autoYieldToJob();
+      setDetecting(true);
+    } else {
+      openExec("正在检测上游版本", null);
+      appendLog({ ts: Date.now() / 1000, level: "info", message: "开始检测所有容器的上游镜像版本…" });
+    }
     api("/api/check", { method: "POST", body: {} }).then(function (j) {
-      connect(j.job_id);
+      connect(j.job_id, silent);
     }).catch(function (e) {
+      state.busy = false;          // 没跑起来，自动刷新照常继续
+      setDetecting(false);
+      scheduleAuto();
+      if (silent) { toast("版本检测失败：" + e.message, "error", 6000); return; }
       appendLog({ ts: Date.now() / 1000, level: "error", message: "提交失败：" + e.message });
       $("execSpinner").className = "spinner failed";
       $("execTitle").textContent = "提交失败";
-      state.busy = false;          // 没跑起来，自动刷新照常继续
-      scheduleAuto();
     });
   }
 
@@ -570,16 +806,16 @@
         ? '<span class="muted">全部容器</span>'
         : esc((s.targets || []).join("、"));
       return '<tr>' +
-        '<td><div class="ct-name">' + esc(s.name) + '</div>' +
+        '<td data-label="任务"><div class="ct-name">' + esc(s.name) + '</div>' +
           '<div class="ct-sub">' + esc(s.id) + '</div></td>' +
-        '<td>' + modeBadge + '</td>' +
-        '<td>' + targets + '</td>' +
-        '<td>' + esc(s.frequency || "") + '</td>' +
-        '<td class="mono">' + esc(nextRunText(s)) + '</td>' +
-        '<td>' + lastResultCell(s) + '</td>' +
-        '<td><label class="mini-switch"><input type="checkbox" class="sc-toggle" data-id="' +
+        '<td data-label="模式">' + modeBadge + '</td>' +
+        '<td data-label="目标容器">' + targets + '</td>' +
+        '<td data-label="频率">' + esc(s.frequency || "") + '</td>' +
+        '<td class="mono" data-label="下次运行">' + esc(nextRunText(s)) + '</td>' +
+        '<td data-label="上次结果">' + lastResultCell(s) + '</td>' +
+        '<td data-label="启用"><label class="mini-switch"><input type="checkbox" class="sc-toggle" data-id="' +
           esc(s.id) + '"' + (s.enabled ? " checked" : "") + '></label></td>' +
-        '<td class="r">' +
+        '<td class="r sc-acts">' +
           '<button class="btn tiny sc-run" data-id="' + esc(s.id) + '">立即执行</button> ' +
           '<button class="btn tiny ghost sc-edit" data-id="' + esc(s.id) + '">编辑</button> ' +
           '<button class="btn tiny ghost sc-del" data-id="' + esc(s.id) + '">删除</button>' +
@@ -613,7 +849,7 @@
         api("/api/schedules", { method: "POST",
           body: { action: "toggle", id: cb.dataset.id, enabled: on } })
           .then(function (j) { applySettings(j.data); })
-          .catch(function (e) { cb.checked = !on; alert("操作失败：" + e.message); });
+          .catch(function (e) { cb.checked = !on; toast("操作失败：" + e.message, "error"); });
       });
     });
     Array.prototype.forEach.call(document.querySelectorAll(".sc-run"), function (b) {
@@ -628,10 +864,18 @@
     Array.prototype.forEach.call(document.querySelectorAll(".sc-del"), function (b) {
       b.addEventListener("click", function () {
         var s = findSchedule(b.dataset.id);
-        if (!s || !confirm("确定删除定时任务「" + s.name + "」？")) return;
-        api("/api/schedules", { method: "POST", body: { action: "delete", id: s.id } })
-          .then(function (j) { applySettings(j.data); })
-          .catch(function (e) { alert("删除失败：" + e.message); });
+        if (!s) return;
+        confirmBox({
+          title: "删除定时任务",
+          html: '<p class="cfm-lead">确定删除定时任务 <b>' + esc(s.name) + '</b>？</p>' +
+                '<p class="cfm-note">删除后不再自动执行；已经产生的执行历史会保留。</p>',
+          okText: "删除", danger: true
+        }).then(function (yes) {
+          if (!yes) return;
+          api("/api/schedules", { method: "POST", body: { action: "delete", id: s.id } })
+            .then(function (j) { applySettings(j.data); toast("已删除「" + s.name + "」", "ok"); })
+            .catch(function (e) { toast("删除失败：" + e.message, "error"); });
+        });
       });
     });
   }
@@ -653,7 +897,7 @@
           connect(j.data.job_id);
         }
       })
-      .catch(function (e) { alert("执行失败：" + e.message); });
+      .catch(function (e) { toast("执行失败：" + e.message, "error"); });
   }
 
   /* ---------------- 定时任务弹窗 ---------------- */
@@ -795,7 +1039,7 @@
         state.setInited = false;
         $("setModal").classList.add("hidden");
       })
-      .catch(function (e) { alert("保存失败：" + e.message); });
+      .catch(function (e) { toast("保存失败：" + e.message, "error"); });
   }
 
   /* ---------------- 历史 ---------------- */
@@ -867,7 +1111,23 @@
     // 手动刷新只提前拉一次，并把自动刷新的倒计时重新起算（免得刚点完又被刷一遍）
     loadOverview().then(function () { if (state.auto) scheduleAuto(); });
   });
-  $("btnCheck").addEventListener("click", startCheck);
+  $("btnCheck").addEventListener("click", function () { startCheck(false); });
+  $("btnCheckInline").addEventListener("click", function () { startCheck(false); });
+  $("btnUpdateAll").addEventListener("click", function () {
+    startUpdate(updatableContainers().map(function (c) { return c.name; }));
+  });
+
+  // 通用确认弹窗
+  $("cfmOk").addEventListener("click", function () { closeBox(true); });
+  $("cfmCancel").addEventListener("click", function () { closeBox(false); });
+  $("cfmModal").addEventListener("click", function (e) {
+    if (e.target === this) closeBox(false);
+  });
+  document.addEventListener("keydown", function (e) {
+    if ((e.key === "Escape" || e.keyCode === 27) && !$("cfmModal").classList.contains("hidden")) {
+      closeBox(false);
+    }
+  });
 
   // 退出登录：先让服务端把会话 cookie 清掉，再回登录页。
   // 清不掉（网络抖动）也照样跳，避免把人卡在页面上。
@@ -930,30 +1190,30 @@
     if (!t) return;
     $("tagModal").classList.add("hidden");
     var tag = t.picked || t.tag;
-    openExec("正在更新容器", null);
-    appendLog({ ts: Date.now() / 1000, level: "info",
-                message: "提交更新请求：" + t.name + " → " + tag });
-    api("/api/update", { method: "POST", body: { containers: [t.name], tag: tag,
-                                                 dry_run: $("dryRun").checked } })
-      .then(function (j) { connect(j.job_id); })
-      .catch(function (e) {
-        appendLog({ ts: Date.now() / 1000, level: "error", message: "提交失败：" + e.message });
-        state.busy = false;
-        scheduleAuto();
-      });
+    if (state.busy || state.source) { toast("已有任务在执行，等它跑完再说", "warn"); return; }
+    confirmUpdate([t.name], tag).then(function (yes) {
+      if (yes) runUpdate([t.name], tag);
+    });
   });
   $("lnkRegistries").addEventListener("click", function (e) {
     e.preventDefault();
+    function list(items) {
+      return '<ol class="cfm-list cfm-ol">' + items.map(function (s) {
+        return '<li class="mono">' + esc(s) + '</li>';
+      }).join("") + '</ol>';
+    }
     var src = (state.mirrors || []).slice();
     if (src.length) {
-      alert("镜像加速源（读取自爱快 Docker 服务设置，按顺序回退）：\n\n" + src.join("\n") +
-            "\n\n镜像由爱快自己下载，改爱快后台这一处即可，本工具自动跟随。");
+      infoBox("镜像加速源",
+        '<p class="cfm-lead">读取自爱快 Docker 服务设置，按顺序回退：</p>' + list(src) +
+        '<p class="cfm-note">镜像由<b>爱快自己下载</b>，改爱快后台这一处即可，本工具自动跟随。</p>');
       return;
     }
     api("/api/config").then(function (j) {
-      alert("没能读到爱快的加速源，当前退回本工具内置源：\n\n" +
-            (j.data.registries || []).join("\n"));
-    });
+      infoBox("镜像加速源（兜底）",
+        '<p class="cfm-lead">没能读到爱快的加速源，当前退回本工具内置源：</p>' +
+        list(j.data.registries || []));
+    }).catch(function (err) { toast("读取失败：" + err.message, "error"); });
   });
 
   /* ---------------- 设置 / 定时任务 事件 ---------------- */

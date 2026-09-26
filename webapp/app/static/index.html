@@ -80,11 +80,23 @@
       <h2>容器 <span class="count" id="ctCount">0</span></h2>
       <div class="panel-tools">
         <span class="muted" id="lastRefresh"></span>
-        <span class="muted" id="checkTime"></span>
         <span class="muted" id="imageCount"></span>
         <button class="btn small" id="btnUpdateSelected" disabled>更新选中</button>
       </div>
     </div>
+
+    <!-- 上游版本概览条：一进来就知道「有没有要更新的 / 要更新哪几个」 -->
+    <div class="upd-bar" id="updBar">
+      <div class="upd-left">
+        <span class="upd-stat" id="updStat">尚未检测上游版本</span>
+        <span class="muted upd-time" id="checkTime"></span>
+      </div>
+      <div class="upd-right">
+        <button class="btn small primary hidden" id="btnUpdateAll">一键更新</button>
+        <button class="btn small ghost" id="btnCheckInline">检测版本</button>
+      </div>
+    </div>
+
     <div class="table-wrap">
       <table class="tbl">
         <thead>
@@ -281,6 +293,23 @@
     <div class="modal-body log-body" id="logBody"></div>
   </div>
 </div>
+
+<!-- 通用确认弹窗 -->
+<div class="modal hidden" id="cfmModal">
+  <div class="modal-box narrow">
+    <div class="modal-head">
+      <strong id="cfmTitle">确认操作</strong>
+    </div>
+    <div class="modal-body" id="cfmBody"></div>
+    <div class="modal-foot">
+      <button class="btn ghost" id="cfmCancel">取消</button>
+      <button class="btn primary" id="cfmOk">确定</button>
+    </div>
+  </div>
+</div>
+
+<!-- 轻提示（右下角堆叠，自动消失） -->
+<div class="toast-wrap" id="toastWrap"></div>
 
 <script src="/static/app.js"></script>
 </body>

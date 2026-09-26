@@ -52,7 +52,7 @@ import jobs as J               # noqa: E402
 import scheduler as SC         # noqa: E402
 import store as S              # noqa: E402
 
-VERSION = "1.3.4"
+VERSION = "1.4.0"
 CFG = A.load_config()
 MANAGER = J.JobManager(CFG)
 # 持久化设置：页面里改的下载超时、定时任务都落在这里（Docker 卷 /data）

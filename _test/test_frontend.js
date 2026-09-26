@@ -125,7 +125,7 @@ FakeEventSource.prototype.emit = function (t, obj) {
 /* ---------------- 跑起来 ---------------- */
 const ctx = {
   document: documentStub,
-  location: { search: "?autorefresh=" + AUTO_SEC },
+  location: { search: "?autorefresh=" + AUTO_SEC + "&autocheck=0" },
   localStorage: ls,
   fetch: fetchStub,
   EventSource: FakeEventSource,

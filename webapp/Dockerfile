@@ -13,7 +13,7 @@ FROM ${BASE_IMAGE}
 
 # 版本号：CI 打 tag 时由 git tag 注入（见 .github/workflows/ci.yml），
 # 本地直接 docker build 时就用下面的默认值。
-ARG APP_VERSION=1.3.3
+ARG APP_VERSION=1.4.0
 
 LABEL org.opencontainers.image.title="idocker" \
       org.opencontainers.image.description="爱快(iKuai) 4.0 Docker 容器更新器，带可视化执行流程" \

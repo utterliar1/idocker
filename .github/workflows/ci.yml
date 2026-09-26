@@ -62,8 +62,11 @@ jobs:
       - name: 后端回归（假爱快 + 真 server，110 项）
         run: python _test/test_webapp.py
 
-      - name: 前端回归（DOM 桩跑真 app.js，24 项）
+      - name: 前端回归 · 自动刷新（DOM 桩跑真 app.js，24 项）
         run: node _test/test_frontend.js
+
+      - name: 前端回归 · 交互与状态呈现（DOM 桩跑真 app.js，36 项）
+        run: node _test/test_frontend_ux.js
 
   # ------------------------------------------------------------
   # 2. 构建并推送 ghcr.io（test 绿了才跑，PR 不推）
@@ -191,6 +194,27 @@ jobs:
           curl -fsS -o /dev/null http://127.0.0.1:18088/static/app.js
           curl -fsS -o /dev/null http://127.0.0.1:18088/static/style.css
           echo "首页 + app.js + style.css 均 200"
+
+      # 前端资源漏打是最隐蔽的一类构建事故：页面能开，但少了新加的控件，
+      # 用户看到的就是「功能没了」。这里对着真容器确认关键钩子都在。
+      - name: 页面里该有的控件都在
+        run: |
+          set -euo pipefail
+          page=$(curl -fsS http://127.0.0.1:18088/)
+          for id in updBar updStat btnUpdateAll btnCheckInline cfmModal toastWrap; do
+            grep -q "id=\"$id\"" <<< "$page" \
+              || { echo "::error::首页缺少控件 #$id"; exit 1; }
+          done
+          echo "概览条 / 一键更新 / 确认框 / 轻提示 的元素都在"
+          js=$(curl -fsS http://127.0.0.1:18088/static/app.js)
+          for fn in confirmUpdate updatableContainers renderUpdBar maybeAutoCheck; do
+            grep -q "$fn" <<< "$js" \
+              || { echo "::error::app.js 缺少函数 $fn"; exit 1; }
+          done
+          css=$(curl -fsS http://127.0.0.1:18088/static/style.css)
+          grep -q "prefers-color-scheme: dark" <<< "$css" \
+            || { echo "::error::style.css 缺少深色主题"; exit 1; }
+          echo "app.js 新函数与深色主题样式均在"
 
       - name: 容器自带健康检查脚本能通过
         run: docker exec smoke python healthcheck.py
