@@ -8,6 +8,9 @@
 
 接口
   GET  /                        前端页面
+  GET  /login                   登录页（未登录时页面会被引导到这里）
+  POST /api/login               提交账号密码，成功后下发会话 cookie
+  POST /api/logout              退出登录，清掉会话 cookie
   GET  /static/<file>           静态资源
   GET  /api/health              健康检查（Docker HEALTHCHECK 用）
   GET  /api/overview            一次性拿容器/镜像/服务设置/配置/定时任务
@@ -27,6 +30,9 @@
 """
 
 import base64
+import hashlib
+import hmac
+import html
 import json
 import os
 import re
@@ -46,7 +52,7 @@ import jobs as J               # noqa: E402
 import scheduler as SC         # noqa: E402
 import store as S              # noqa: E402
 
-VERSION = "1.3.3"
+VERSION = "1.3.4"
 CFG = A.load_config()
 MANAGER = J.JobManager(CFG)
 # 持久化设置：页面里改的下载超时、定时任务都落在这里（Docker 卷 /data）
@@ -79,6 +85,202 @@ class ApiError(Exception):
         self.message = message
 
 
+# =================================================================
+# 访问认证
+#
+# 早期版本用 HTTP Basic：浏览器弹出的是**原生账号框**，密码管理器
+# （Chrome / Edge / 1Password / Bitwarden……）识别不了这种框，所以既不会
+# 提示保存、也没法自动填充，每次都得手打一遍。
+#
+# 现在换成标准的「登录页 + 表单 POST + 会话 cookie」：页面上是真正的
+# <form>，账号/密码框带 autocomplete="username" / "current-password"，
+# 浏览器和密码管理器都能正常识别、保存、一键填充。
+#
+# 兼容：Authorization: Basic 头照旧接受（curl、脚本、旧书签、CI 都不受影响）。
+# =================================================================
+COOKIE_NAME = "idocker_session"
+SESSION_TTL = 7 * 24 * 3600        # 登录状态保持 7 天，期间免登录
+LOGIN_MAX_FAILS = 5                # 同一来源连续失败次数上限
+LOGIN_LOCK_SECONDS = 60            # 触发上限后锁多久
+
+_login_fails = {}                  # ip -> {"n": 失败次数, "until": 解锁时间戳}
+_login_lock = threading.Lock()
+
+
+def auth_enabled():
+    return bool(os.environ.get("AUTH_USER") or "")
+
+
+def _session_secret():
+    """会话签名密钥：从当前账号密码派生。
+
+    这样不用新增配置项、也不用落盘；改了密码，所有已发出的 cookie 立即失效。
+    """
+    seed = "idocker-session-v1|%s|%s" % (os.environ.get("AUTH_USER") or "",
+                                         os.environ.get("AUTH_PASS") or "")
+    return hashlib.sha256(seed.encode("utf-8")).digest()
+
+
+def make_session_token(user, ttl=SESSION_TTL):
+    """生成「用户名|过期时间|HMAC 签名」并 base64 编码 —— 无状态，重启也不掉线。"""
+    exp = int(time.time()) + int(ttl)
+    payload = "%s|%d" % (user, exp)
+    sig = hmac.new(_session_secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(("%s|%s" % (payload, sig)).encode("utf-8")).decode("ascii")
+
+
+def read_session_token(token):
+    """校验签名与有效期，通过则返回用户名，否则 None。"""
+    try:
+        raw = base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
+    except Exception:                                           # noqa: BLE001
+        return None
+    user, _, rest = raw.partition("|")
+    exp_s, _, sig = rest.partition("|")
+    if not user or not exp_s or not sig:
+        return None
+    payload = "%s|%s" % (user, exp_s)
+    want = hmac.new(_session_secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, want):                      # 防时序攻击
+        return None
+    try:
+        if int(exp_s) < time.time():
+            return None                                         # 过期
+    except ValueError:
+        return None
+    return user
+
+
+def parse_cookies(header):
+    out = {}
+    for part in (header or "").split(";"):
+        key, _, val = part.partition("=")
+        key = key.strip()
+        if key:
+            out[key] = val.strip()
+    return out
+
+
+def safe_next(value):
+    """只接受站内相对路径，挡掉 //evil.com 这类开放重定向。"""
+    value = (value or "").strip()
+    if not value.startswith("/") or value.startswith("//") or value.startswith("/\\"):
+        return "/"
+    return value
+
+
+def login_locked_for(ip):
+    """返回剩余锁定秒数（0 = 没被锁）。"""
+    with _login_lock:
+        rec = _login_fails.get(ip)
+        if not rec:
+            return 0
+        left = rec.get("until", 0) - time.time()
+        return int(left) + 1 if left > 0 else 0
+
+
+def note_login_fail(ip):
+    with _login_lock:
+        rec = _login_fails.setdefault(ip, {"n": 0, "until": 0})
+        rec["n"] += 1
+        if rec["n"] >= LOGIN_MAX_FAILS:
+            rec["until"] = time.time() + LOGIN_LOCK_SECONDS
+            rec["n"] = 0
+        return rec
+
+
+def clear_login_fails(ip):
+    with _login_lock:
+        _login_fails.pop(ip, None)
+
+
+LOGIN_PAGE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录 · 爱快 Docker 容器更新器</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#128051;</text></svg>">
+<style>
+:root {
+  --bg: #f5f7fa; --card: #fff; --border: #e4e7ec; --text: #101828;
+  --muted: #667085; --primary: #2563eb; --danger: #dc2626; --danger-soft: #fef3f2;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; min-height: 100vh; display: flex; align-items: center;
+  justify-content: center; padding: 24px;
+  background: var(--bg); color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+               "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  font-size: 14px; line-height: 1.5; -webkit-font-smoothing: antialiased;
+}
+.card {
+  width: 100%; max-width: 360px; background: var(--card);
+  border: 1px solid var(--border); border-radius: 12px; padding: 28px 26px 26px;
+  box-shadow: 0 1px 3px rgba(16,24,40,.06), 0 1px 2px rgba(16,24,40,.04);
+}
+.logo { font-size: 30px; line-height: 1; }
+h1 { font-size: 17px; margin: 12px 0 4px; }
+.sub { margin: 0 0 20px; color: var(--muted); font-size: 13px; }
+.err {
+  background: var(--danger-soft); border: 1px solid #fecdca; color: #b42318;
+  border-radius: 8px; padding: 9px 11px; font-size: 13px; margin-bottom: 16px;
+}
+label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+input[type=text], input[type=password] {
+  width: 100%; padding: 9px 11px; margin-bottom: 14px; font-size: 14px;
+  color: var(--text); background: #fff;
+  border: 1px solid #d0d5dd; border-radius: 8px; outline: none;
+}
+input[type=text]:focus, input[type=password]:focus {
+  border-color: var(--primary); box-shadow: 0 0 0 3px rgba(37,99,235,.12);
+}
+button {
+  width: 100%; padding: 10px; font-size: 14px; font-weight: 500; color: #fff;
+  background: var(--primary); border: 0; border-radius: 8px; cursor: pointer;
+}
+button:hover { background: #1d4ed8; }
+.tip { margin: 16px 0 0; font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<main class="card">
+  <div class="logo">&#128051;</div>
+  <h1>爱快 Docker 容器更新器</h1>
+  <p class="sub">请登录后继续</p>
+  {{ERROR}}
+  <form method="post" action="/api/login" autocomplete="on">
+    <label for="username">账号</label>
+    <input id="username" name="username" type="text" value="{{USERNAME}}"
+           autocomplete="username" autocapitalize="none" autocorrect="off"
+           spellcheck="false" required autofocus>
+    <label for="password">密码</label>
+    <input id="password" name="password" type="password"
+           autocomplete="current-password" required>
+    <input type="hidden" name="next" value="{{NEXT}}">
+    <button type="submit">登录</button>
+  </form>
+  <p class="tip">登录状态保持 7 天。浏览器 / 密码管理器会提示保存，下次可自动填充。</p>
+</main>
+</body>
+</html>
+"""
+
+
+def render_login_page(error="", username="", next_url="/"):
+    """渲染登录页。
+
+    刻意用占位符替换而不是 %-格式化：页面里的 CSS 有大量 `100%`，
+    走 %-格式化会被当成格式符直接抛异常。
+    """
+    block = '<div class="err">%s</div>' % html.escape(error) if error else ""
+    return (LOGIN_PAGE
+            .replace("{{ERROR}}", block)
+            .replace("{{USERNAME}}", html.escape(username or "", quote=True))
+            .replace("{{NEXT}}", html.escape(safe_next(next_url), quote=True)))
+
+
 def history_brief(h):
     """历史列表用的摘要：不带日志明细，只给行数。
 
@@ -98,21 +300,143 @@ class Handler(BaseHTTPRequestHandler):
         if os.environ.get("DEBUG"):
             sys.stderr.write("[%s] %s\n" % (now_str(), fmt % args))
 
+    def _client_ip(self):
+        # 内网直连场景，不解析 X-Forwarded-For：那个头客户端可以随便编，
+        # 拿它做限速等于把限速关掉。
+        return self.client_address[0] if self.client_address else "?"
+
     def _auth_ok(self):
-        want_user = os.environ.get("AUTH_USER") or ""
-        if not want_user:
+        if not auth_enabled():
             return True
+        want_user = os.environ.get("AUTH_USER") or ""
         want_pass = os.environ.get("AUTH_PASS") or ""
+
+        # 1) 会话 cookie —— 登录页表单写入的，浏览器会自动带上
+        token = parse_cookies(self.headers.get("Cookie")).get(COOKIE_NAME)
+        if token:
+            user = read_session_token(token)
+            if user and hmac.compare_digest(user, want_user):
+                return True
+
+        # 2) 仍然接受 Basic 头：curl、脚本、旧书签、CI 都不受影响
         header = self.headers.get("Authorization") or ""
-        if not header.startswith("Basic "):
-            return False
-        try:
-            raw = base64.b64decode(header[6:]).decode("utf-8", "replace")
-            user, _, pw = raw.partition(":")
-            ok = (user == want_user) and (pw == want_pass)
-            return ok
-        except Exception:
-            return False
+        if header.startswith("Basic "):
+            try:
+                raw = base64.b64decode(header[6:]).decode("utf-8", "replace")
+                user, _, pw = raw.partition(":")
+                if (hmac.compare_digest(user, want_user)
+                        and hmac.compare_digest(pw, want_pass)):
+                    return True
+            except Exception:                                   # noqa: BLE001
+                return False
+        return False
+
+    # -- 认证相关的响应工具 ----------------------------------------
+    def _send_html(self, body, status=200):
+        raw = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _redirect(self, location, status=302):
+        self.send_response(status)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _deny(self):
+        """未认证：接口回 401 JSON（前端据此跳登录页），页面直接引导到登录页。
+
+        注意这里**不下发 WWW-Authenticate** —— 那正是浏览器弹原生账号框的
+        触发条件，也是密码管理器没法自动填充的根源。
+        """
+        if urllib.parse.urlparse(self.path).path.startswith("/api/"):
+            return self._send_error_json("未登录或登录已过期，请重新登录", 401)
+        target = self.path if self.path.startswith("/") else "/"
+        return self._redirect("/login?next=" + urllib.parse.quote(target, safe="/"))
+
+    def _set_session_cookie(self, user):
+        self.send_header(
+            "Set-Cookie",
+            "%s=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Lax"
+            % (COOKIE_NAME, make_session_token(user), SESSION_TTL))
+
+    def _clear_session_cookie(self):
+        self.send_header("Set-Cookie",
+                         "%s=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax" % COOKIE_NAME)
+
+    def _login_page(self, error="", username="", next_url="/"):
+        return self._send_html(render_login_page(error, username, next_url),
+                               status=200 if not error else 401)
+
+    def _is_json_client(self):
+        return (self.headers.get("Content-Type") or "").lower().startswith("application/json")
+
+    def _do_login(self):
+        ip = self._client_ip()
+        left = login_locked_for(ip)
+        if left:
+            return self._login_failed(ip, "尝试次数过多，请 %d 秒后再试" % left, count=False)
+
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length > 0 else b""
+        if self._is_json_client():
+            try:
+                data = json.loads(raw.decode("utf-8") or "{}")
+            except ValueError:
+                data = {}
+        else:
+            # 浏览器原生表单提交（application/x-www-form-urlencoded）
+            data = {k: v[0] for k, v in
+                    urllib.parse.parse_qs(raw.decode("utf-8", "replace")).items()}
+
+        user = str(data.get("username") or "")
+        pw = str(data.get("password") or "")
+        next_url = safe_next(data.get("next"))
+
+        if not auth_enabled():                  # 没开认证就不用登录
+            return self._redirect(next_url)
+
+        want_user = os.environ.get("AUTH_USER") or ""
+        want_pass = os.environ.get("AUTH_PASS") or ""
+        if (hmac.compare_digest(user, want_user)
+                and hmac.compare_digest(pw, want_pass)):
+            clear_login_fails(ip)
+            self.send_response(302)
+            self._set_session_cookie(user)
+            self.send_header("Location", next_url)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        return self._login_failed(ip, "账号或密码不正确", user, next_url)
+
+    def _login_failed(self, ip, message, username="", next_url="/", count=True):
+        if count:
+            note_login_fail(ip)
+        if self._is_json_client():
+            return self._send_error_json(message, 401)
+        # 表单提交：把登录页原样送回去并带上错误提示，用户名留着省得重打
+        return self._login_page(message, username, next_url)
+
+    def _do_logout(self):
+        if self._is_json_client():
+            self.send_response(200)
+            self._clear_session_cookie()
+            body = json.dumps({"ok": True}).encode("utf-8")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(302)
+        self._clear_session_cookie()
+        self.send_header("Location", "/login")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _send_json(self, obj, status=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -154,14 +478,22 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- 入口 ------------------------------------------------------
     def do_GET(self):
-        if not self._auth_ok():
-            self.send_response(401)
-            self.send_header("WWW-Authenticate", 'Basic realm="idocker"')
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
         parsed = urllib.parse.urlparse(self.path)
         path, query = parsed.path, urllib.parse.parse_qs(parsed.query)
+
+        # 登录页必须放行，否则会陷入「要登录得先开页面、要开页面得先登录」的死循环
+        if path == "/login":
+            next_url = (query.get("next") or ["/"])[0]
+            if self._auth_ok():
+                return self._redirect(safe_next(next_url))
+            return self._login_page("", next_url=next_url)
+
+        if path == "/api/logout":               # 也支持 GET，方便直接放一个退出链接
+            return self._do_logout()
+
+        if not self._auth_ok():
+            return self._deny()
+
         try:
             if path in ("/", "/index.html"):
                 return self._serve_static("index.html")
@@ -217,13 +549,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error_json("%s: %s" % (type(e).__name__, e), 500)
 
     def do_POST(self):
-        if not self._auth_ok():
-            self.send_response(401)
-            self.send_header("WWW-Authenticate", 'Basic realm="idocker"')
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
         path = urllib.parse.urlparse(self.path).path
+        if path == "/api/login":
+            return self._do_login()
+        if path == "/api/logout":
+            return self._do_logout()
+        if not self._auth_ok():
+            return self._deny()
         try:
             body = self._read_json_body()
             if path == "/api/check":
@@ -323,6 +655,8 @@ class Handler(BaseHTTPRequestHandler):
             "dry_run": bool(CFG.get("dry_run")),
             "pull_timeout": CFG.get("pull_timeout"),
             "version": VERSION,
+            # 前端据此决定要不要显示「退出登录」按钮
+            "auth_enabled": auth_enabled(),
         }
 
     def _overview(self):
@@ -420,7 +754,8 @@ def main():
     print("  下载超时    %d 秒（可在页面上调整）" % CFG["pull_timeout"], flush=True)
     print("  定时任务    %d 条" % len(STORE.schedules()), flush=True)
     print("  干跑模式    %s" % ("开启" if CFG.get("dry_run") else "关闭"), flush=True)
-    print("  访问认证    %s" % ("开启" if os.environ.get("AUTH_USER") else "关闭"), flush=True)
+    print("  访问认证    %s" % ("登录页（账号 %s）" % os.environ["AUTH_USER"]
+                              if auth_enabled() else "关闭"), flush=True)
     print("=" * 62, flush=True)
     if not CFG["router"]["url"]:
         print("⚠ 未配置 IKUAI_URL，页面能打开但无法读取容器", flush=True)

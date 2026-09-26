@@ -78,8 +78,8 @@ services:
       IKUAI_URL: "192.168.123.1"    # 你的爱快地址
       IKUAI_USER: "admin"
       IKUAI_PASS: "你的爱快密码"
-      AUTH_USER: "admin"            # 网页访问认证；留空 = 不认证（仅限内网）
-      AUTH_PASS: "你的网页访问密码"
+      AUTH_USER: "admin"            # 网页登录账号；留空 = 不认证（仅限内网）
+      AUTH_PASS: "你的网页访问密码"   # 登录页登录；密码管理器可保存并自动填充
       PULL_TIMEOUT: "1800"          # 大镜像等久一点
       TZ: "Asia/Shanghai"
     volumes:
@@ -99,7 +99,7 @@ docker compose logs -f              # 看到启动横幅即成功，Ctrl+C 退�
 |---|---|
 | `latest` | main 分支每次推送 |
 | `sha-xxxxxxx` | 每次构建，钉住具体 commit |
-| `1.3.3`、`1.3` | 推 `v1.3.3` 这样的 tag 时 |
+| `1.3.4`、`1.3` | 推 `v1.3.4` 这样的 tag 时 |
 
 > 拉不动 ghcr.io 的话，给镜像名加个加速前缀即可，例如
 > `docker.1ms.run/ghcr.io/utterliar1/idocker:latest`。
@@ -130,8 +130,8 @@ IKUAI_URL=192.168.123.1          # 你的爱快后台地址
 IKUAI_USER=admin                 # 爱快登录账号
 IKUAI_PASS=你的爱快密码
 
-AUTH_USER=admin                  # 网页访问账号
-AUTH_PASS=你自己设的访问密码       # 留空 = 不认证，只建议纯内网用
+AUTH_USER=admin                  # 网页登录账号
+AUTH_PASS=你自己设的访问密码       # 留空 = 不认证，只建议纯内网用；登录后 7 天内免重复登录
 
 WEB_PORT=8088                    # 对外端口（注意：飞牛上 8088 常被 filebrowser 占用，冲突就改）
 PULL_TIMEOUT=240                 # 等镜像下载的最长秒数，镜像大就调大
@@ -295,6 +295,28 @@ http://飞牛IP:8088/?autorefresh=300              把自动刷新间隔改成 3
 
 ---
 
+### 登录（密码管理器能自动填充）
+
+开了 `AUTH_USER` / `AUTH_PASS` 之后，打开网页先看到的是**登录页**，而不是浏览器弹出的
+原生账号框。
+
+这个区别很实际：原生框（HTTP Basic）密码管理器识别不了 —— 既不提示保存、也没法自动填充，
+每次访问都得手打一遍。登录页是标准 `<form>`，账号框带 `autocomplete="username"`、
+密码框带 `autocomplete="current-password"`，浏览器和 1Password / Bitwarden 这类工具
+都能正常识别、保存、一键填充。
+
+- 登录状态保持 **7 天**，用的是签名 cookie（`HttpOnly` + `SameSite=Lax`），容器重启也不掉线
+- 改掉 `AUTH_PASS` 会让所有已发出的登录态**立即失效**（密钥由账号密码派生）
+- 同一来源连续输错 5 次密码，临时锁定 60 秒
+- 顶栏右侧的「退出」按钮可主动登出
+- **`curl` / 脚本 / CI 仍可用 `Authorization: Basic` 头**，不受影响
+- 浏览器弹原生框的开关是 `WWW-Authenticate` 响应头，本工具已经不再下发它
+
+> 直连 IP、走 HTTP 的场景下，cookie 不带 `Secure` 标志（带了就不会发送）。
+> 要更强保障，就在前面套一层 HTTPS 反向代理。
+
+---
+
 ## 安全须知
 
 - **务必设置 `AUTH_PASS`**。这个网页持有你路由器的登录凭据，虽然凭据不会下发到浏览器，但未认证的页面等于把路由器操作权限开放给整个局域网。
@@ -408,14 +430,15 @@ BASE_IMAGE=docker.1ms.run/library/python:3.13-alpine
 push / PR
    │
    ▼
-① test    后端 83 项 + 前端 24 项回归（假爱快 + DOM 桩，零依赖，不装 pip 包）
+① test    后端 110 项 + 前端 24 项回归（假爱快 + DOM 桩，零依赖，不装 pip 包）
    │       ✗ 挂 → 到此为止，不产出镜像
    ▼ ✓
 ② build   构建镜像并推到 ghcr.io/utterliar1/idocker
    │       PR 不推，只构建；main 推 latest + sha-xxxxxxx；打 v* tag 推语义版本
    ▼
 ③ smoke   把刚推上去的镜像真拉下来起容器：探活 /api/health、首页与静态资源、
-          容器自带 healthcheck.py、确认以非 root（appuser）运行
+          容器自带 healthcheck.py、确认以非 root（appuser）运行，
+          再单独起一个开了访问认证的容器验证登录页与会话 cookie 全链路
 ```
 
 一句话：**测试没过就没有镜像，镜像产出了还得自己先跑得起来**。
@@ -487,7 +510,7 @@ python fnos_ssh.py --put webapp/Dockerfile /vol1/1000/docker/idocker/Dockerfile
 同仓库上一层的 `_test/` 是本地回归测试，不参与镜像构建，改代码后可以先跑一遍再上机：
 
 ```bash
-python _test/test_webapp.py          # 后端 83 项：假爱快 + 端到端断言
+python _test/test_webapp.py          # 后端 110 项：假爱快 + 端到端断言
                                      #   （调度触发、超时跳过、幂等跳过、并发保护、加速源同源、历史日志等）
 node _test/test_frontend.js          # 前端 24 项：DOM 桩直接跑 app.js
                                      #   （自动刷新开关/暂停、倒计时、静默刷新不重绘、后台顺延、任务期间让路）

@@ -4,9 +4,11 @@
 
 起一个假爱快（mock_router）+ 真的 server.py，跑一遍：
   设置读写 / 定时任务增删改查 / 立即执行 / 调度器自动触发 / 下载超时跳过 / 上游未变跳过
+  / 更新后启动日志核查 / 访问认证（登录页表单 + 会话 cookie）
 
 用法：python _test/test_webapp.py
 """
+import base64
 import json
 import os
 import shutil
@@ -15,6 +17,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -400,6 +403,144 @@ ok("容器无任何日志输出时给出明确告警",
        for e in _ev16b),
    [(e.get("level"), (e.get("message") or "")[:44]) for e in _ev16b[-3:]])
 mock_router.FAKE.container_logs = ["starting service...", "listening on :8080"]
+
+print("\n=== 17. 访问认证（登录页表单 + 会话 cookie）===")
+# 真实痛点：Basic 认证弹的是**浏览器原生账号框**，密码管理器识别不了，
+# 既不提示保存也没法自动填充，每次访问都得手打。
+# 现在改成标准登录页 + 真实 form + 会话 cookie，同时保留 Basic 头给脚本用。
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """不跟随重定向 —— 否则看不到 302 与 Set-Cookie。"""
+
+    def redirect_request(self, *a, **kw):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def raw_req(path, form=None, json_body=None, method=None, cookie=None, basic=None):
+    """发原始请求，返回 (状态码, 响应头 dict[小写], 文本)。"""
+    data, headers = None, {}
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    elif json_body is not None:
+        data = json.dumps(json_body).encode()
+        headers["Content-Type"] = "application/json"
+    r = urllib.request.Request(BASE + path, data=data,
+                               method=method or ("POST" if data else "GET"),
+                               headers=headers)
+    if cookie:
+        r.add_header("Cookie", cookie)
+    if basic:
+        r.add_header("Authorization", "Basic " +
+                     base64.b64encode(("%s:%s" % basic).encode()).decode())
+    try:
+        with _OPENER.open(r, timeout=30) as resp:
+            return (resp.status,
+                    {k.lower(): v for k, v in resp.headers.items()},
+                    resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return (e.code, {k.lower(): v for k, v in e.headers.items()},
+                e.read().decode("utf-8"))
+
+
+server._login_fails.clear()
+os.environ["AUTH_USER"] = "admin"
+os.environ["AUTH_PASS"] = "s3cret-pw"
+
+_code, _h, _ = raw_req("/")
+ok("未登录访问首页会被引导到登录页",
+   _code == 302 and _h.get("location", "").startswith("/login"), (_code, _h.get("location")))
+
+_code, _h, _b = raw_req("/api/containers")
+ok("未登录调接口返回 401（前端据此跳登录页）",
+   _code == 401 and json.loads(_b)["ok"] is False, _code)
+ok("401 不再下发 WWW-Authenticate（那正是浏览器弹原生框的开关）",
+   "www-authenticate" not in _h, list(_h))
+
+_code, _h, _b = raw_req("/login")
+ok("登录页本身可匿名打开，不会死循环", _code == 200, _code)
+ok("登录页是真实 form 表单（密码管理器识别的前提）",
+   '<form method="post" action="/api/login"' in _b)
+ok("账号框带 name + autocomplete=\"username\"",
+   'name="username"' in _b and 'autocomplete="username"' in _b)
+ok("密码框带 name + type=password + autocomplete=\"current-password\"",
+   'name="password"' in _b and 'type="password"' in _b
+   and 'autocomplete="current-password"' in _b)
+ok("登录页不引用需要认证的静态资源（否则样式加载不出来）", "/static/" not in _b)
+
+_code, _h, _b = raw_req("/api/login", json_body={"username": "admin", "password": "bad"})
+ok("JSON 客户端（curl / 脚本）拿到 401 JSON 而不是 HTML 页",
+   _code == 401 and bool(json.loads(_b).get("error")), _b[:80])
+
+_code, _h, _b = raw_req("/api/login",
+                        form={"username": "admin", "password": "wrong", "next": "/"})
+ok("密码错误不放行，也不下发 cookie", _code == 401 and "set-cookie" not in _h, list(_h))
+ok("密码错误时页面回显提示", "不正确" in _b, _b[:80])
+ok("密码错误会保留已填的账号（省得重打）", 'value="admin"' in _b)
+
+_code, _h, _b = raw_req("/api/login",
+                        form={"username": "admin", "password": "s3cret-pw", "next": "/"})
+_ck = _h.get("set-cookie", "")
+ok("登录成功跳回原页面", _code == 302 and _h.get("location") == "/",
+   (_code, _h.get("location")))
+ok("下发会话 cookie，且带 HttpOnly + SameSite=Lax",
+   "idocker_session=" in _ck and "HttpOnly" in _ck and "SameSite=Lax" in _ck, _ck)
+ok("cookie 是签名令牌，不含明文密码", "s3cret-pw" not in _ck, _ck)
+_token = _ck.split(";")[0]
+
+_code, _h, _b = raw_req("/api/overview", cookie=_token)
+ok("带会话 cookie 就能正常用接口",
+   _code == 200 and json.loads(_b)["ok"] is True, _code)
+
+_code, _h, _b = raw_req("/login", cookie=_token)
+ok("已登录再打开登录页会直接跳回首页",
+   _code == 302 and _h.get("location") == "/", (_code, _h.get("location")))
+
+_tampered = _token[:-6] + ("AAAAAA" if not _token.endswith("AAAAAA") else "BBBBBB")
+ok("被改过的 cookie 不通过（签名校验生效）",
+   raw_req("/api/health", cookie="idocker_session=" + _tampered)[0] == 401)
+ok("自己伪造的 cookie 不通过",
+   raw_req("/api/health",
+           cookie="idocker_session=" + base64.urlsafe_b64encode(
+               b"me|9999999999|deadbeef").decode())[0] == 401)
+
+_code, _, _ = raw_req("/api/health", basic=("admin", "s3cret-pw"))
+ok("Authorization: Basic 仍然可用（curl / 脚本 / CI 不受影响）", _code == 200, _code)
+ok("Basic 密码错照样拒", raw_req("/api/health", basic=("admin", "nope"))[0] == 401)
+
+_, _, _b = raw_req("/login?next=//evil.com")
+ok("next 只接受站内路径（防开放重定向）",
+   'value="//evil.com"' not in _b and 'value="/"' in _b)
+_code, _h, _ = raw_req("/api/login",
+                       form={"username": "admin", "password": "s3cret-pw",
+                             "next": "//evil.com"})
+ok("登录成功后也不会被跳到站外", _h.get("location") == "/", _h.get("location"))
+
+_code, _h, _ = raw_req("/api/logout", json_body={}, cookie=_token)
+ok("退出登录会清掉会话 cookie",
+   _code == 200 and "Max-Age=0" in _h.get("set-cookie", ""), _h.get("set-cookie"))
+_code, _h, _ = raw_req("/api/logout", cookie=_token)
+ok("也支持直接访问 /api/logout 退出（方便放个退出链接）",
+   _code == 302 and _h.get("location") == "/login", (_code, _h.get("location")))
+
+server._login_fails.clear()
+for _ in range(server.LOGIN_MAX_FAILS):
+    raw_req("/api/login", form={"username": "admin", "password": "bad", "next": "/"})
+_code, _, _b = raw_req("/api/login",
+                       form={"username": "admin", "password": "s3cret-pw", "next": "/"})
+ok("连续输错达上限后临时锁定，正确密码也先挡住",
+   _code == 401 and "次数过多" in _b, (_code, _b[:60]))
+server._login_fails.clear()
+_code, _h, _ = raw_req("/api/login",
+                       form={"username": "admin", "password": "s3cret-pw", "next": "/"})
+ok("解除锁定后能正常登录", _code == 302 and "set-cookie" in _h, _code)
+
+os.environ.pop("AUTH_USER", None)
+os.environ.pop("AUTH_PASS", None)
 
 print("\n" + "=" * 56)
 print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))

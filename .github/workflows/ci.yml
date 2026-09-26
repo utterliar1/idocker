@@ -59,7 +59,7 @@ jobs:
       - name: 全量语法自检
         run: python -m compileall -q webapp/app _test
 
-      - name: 后端回归（假爱快 + 真 server，83 项）
+      - name: 后端回归（假爱快 + 真 server，110 项）
         run: python _test/test_webapp.py
 
       - name: 前端回归（DOM 桩跑真 app.js，24 项）
@@ -202,6 +202,72 @@ jobs:
           echo "容器内用户：$whoami"
           test "$whoami" = "appuser"
 
+      # 访问认证走「登录页 + 表单 + 会话 cookie」，而不是 HTTP Basic 原生弹窗 ——
+      # 原生弹窗密码管理器识别不了，没法自动填充。这里用真容器把整条链路跑一遍。
+      - name: 访问认证 · 登录页与会话 cookie
+        run: |
+          set -euo pipefail
+          IMG="${{ needs.build.outputs.smoke_ref }}"
+          B=http://127.0.0.1:18089
+          docker run -d --name smoke-auth -p 18089:8088 \
+            -e IKUAI_URL=http://127.0.0.1:1 \
+            -e IKUAI_USER=ci -e IKUAI_PASS=ci-only \
+            -e REGISTRIES=http://127.0.0.1:1 \
+            -e HTTP_TIMEOUT=3 \
+            -e AUTH_USER=admin -e AUTH_PASS=ci-pw-only \
+            "$IMG"
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null "$B/login"; then echo "第 $i 次探活通过"; break; fi
+            sleep 2
+          done
+
+          echo "--- 登录页要素 ---"
+          page=$(curl -fsS "$B/login")
+          grep -q '<form method="post" action="/api/login"' <<< "$page" \
+            || { echo "::error::登录页没有真实 form 表单"; exit 1; }
+          grep -q 'autocomplete="username"' <<< "$page" \
+            || { echo "::error::账号框缺少 autocomplete=username"; exit 1; }
+          grep -q 'autocomplete="current-password"' <<< "$page" \
+            || { echo "::error::密码框缺少 autocomplete=current-password"; exit 1; }
+          echo "form + username + current-password 均在（密码管理器可识别、可自动填充）"
+
+          echo "--- 未登录时的行为 ---"
+          hdrs=$(curl -sS -o /dev/null -D - "$B/api/health" | tr -d '\r')
+          test "$(curl -sS -o /dev/null -w '%{http_code}' "$B/api/health")" = "401" \
+            || { echo "::error::未登录调接口没有返回 401"; exit 1; }
+          if grep -qi '^www-authenticate:' <<< "$hdrs"; then
+            echo "::error::下发了 WWW-Authenticate，浏览器又会弹原生账号框"; exit 1
+          fi
+          loc=$(curl -sS -o /dev/null -D - "$B/" | tr -d '\r' \
+                | awk 'tolower($1)=="location:"{print $2}')
+          test "$loc" = "/login?next=/" \
+            || { echo "::error::未登录访问首页没有跳登录页，实际：$loc"; exit 1; }
+          echo "接口 401（无 WWW-Authenticate）、页面跳 /login"
+
+          echo "--- 密码错误 ---"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' \
+                 -d 'username=admin&password=wrong&next=/' "$B/api/login")" = "401" \
+            || { echo "::error::密码错误竟然放行"; exit 1; }
+
+          echo "--- 登录成功 ---"
+          curl -sS -c /tmp/ck.txt -o /dev/null \
+            -d 'username=admin&password=ci-pw-only&next=/' "$B/api/login"
+          grep -q idocker_session /tmp/ck.txt \
+            || { echo "::error::登录成功后没有下发会话 cookie"; cat /tmp/ck.txt; exit 1; }
+          test "$(curl -sS -b /tmp/ck.txt -o /dev/null -w '%{http_code}' "$B/api/health")" = "200" \
+            || { echo "::error::带会话 cookie 仍无法访问接口"; exit 1; }
+          echo "会话 cookie 可用；退出后 cookie 被清掉"
+          curl -sS -b /tmp/ck.txt -c /tmp/ck2.txt -o /dev/null -X POST "$B/api/logout"
+          curl -sS -b /tmp/ck2.txt -o /dev/null -w '%{http_code}\n' "$B/api/health" | grep -q 401 \
+            || { echo "::warning::退出后 cookie 看起来还在"; }
+
+          echo "--- Basic 头兼容 ---"
+          test "$(curl -sS -u admin:ci-pw-only -o /dev/null -w '%{http_code}' "$B/api/health")" = "200" \
+            || { echo "::error::Basic 头被破坏了（脚本/CI 会受影响）"; exit 1; }
+          echo "Authorization: Basic 仍然可用"
+
       - name: 失败时 dump 容器日志
         if: failure()
-        run: docker logs smoke 2>&1 | tail -60 || true
+        run: |
+          docker logs smoke 2>&1 | tail -60 || true
+          docker logs smoke-auth 2>&1 | tail -60 || true

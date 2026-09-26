@@ -25,7 +25,7 @@ services:
     # 想跳过本地构建、直接用 CI 产出的官方镜像，就注释掉上面的 build:，
     # 并把下面这行换成：
     #   image: ghcr.io/utterliar1/idocker:latest
-    image: idocker:1.3.3
+    image: idocker:1.3.4
     container_name: idocker
     restart: unless-stopped
 
@@ -40,7 +40,8 @@ services:
       IKUAI_USER: "${IKUAI_USER:-admin}"            # 登录账号
       IKUAI_PASS: "${IKUAI_PASS:-请改成你的密码}"     # 登录密码
 
-      # ---------- 建议填：给网页加访问认证 ----------
+      # ---------- 建议填：给网页加登录 ----------
+      # 打开网页会看到登录页（标准表单，密码管理器可自动填充），登录后 7 天免重复登录
       AUTH_USER: "${AUTH_USER:-admin}"              # 留空则关闭认证（仅限内网！）
       AUTH_PASS: "${AUTH_PASS:-请改成访问密码}"
 

@@ -45,6 +45,13 @@
   })();
 
   /* ---------------- 基础 ---------------- */
+  function goLogin() {
+    // 会话过期 / 未登录：带上当前地址，登录后原路返回。
+    // 服务端也会在页面类请求上直接 302 到登录页，这里主要兜住接口请求。
+    var back = (location.pathname || "/") + (location.search || "");
+    location.href = "/login?next=" + encodeURIComponent(back);
+  }
+
   function api(path, opts) {
     opts = opts || {};
     return fetch(path, {
@@ -52,6 +59,11 @@
       headers: { "Content-Type": "application/json" },
       body: opts.body ? JSON.stringify(opts.body) : undefined
     }).then(function (r) {
+      // 401 = 没登录或登录过期。以前这里是浏览器原生弹框，现在跳登录页。
+      if (r.status === 401) {
+        goLogin();
+        throw new Error("登录已过期，正在跳转登录页…");
+      }
       return r.json().then(function (j) {
         if (!r.ok || j.ok === false) throw new Error(j.error || ("HTTP " + r.status));
         return j;
@@ -114,6 +126,13 @@
       if (!state.inited) {
         $("dryRun").checked = !!cfg.dry_run;
         state.inited = true;
+      }
+
+      // 只有开了访问认证才显示「退出登录」
+      var btnLogout = $("btnLogout");
+      if (btnLogout) {
+        if (cfg.auth_enabled) btnLogout.classList.remove("hidden");
+        else btnLogout.classList.add("hidden");
       }
 
       if (!cfg.router_url) {
@@ -849,6 +868,19 @@
     loadOverview().then(function () { if (state.auto) scheduleAuto(); });
   });
   $("btnCheck").addEventListener("click", startCheck);
+
+  // 退出登录：先让服务端把会话 cookie 清掉，再回登录页。
+  // 清不掉（网络抖动）也照样跳，避免把人卡在页面上。
+  (function () {
+    var el = $("btnLogout");
+    if (!el) return;
+    el.addEventListener("click", function () {
+      el.disabled = true;
+      fetch("/api/logout", { method: "POST" })
+        .catch(function () {})
+        .then(function () { location.href = "/login"; });
+    });
+  })();
   $("btnReloadHist").addEventListener("click", loadHistory);
   $("btnCloseLog").addEventListener("click", function () {
     $("logModal").classList.add("hidden");
