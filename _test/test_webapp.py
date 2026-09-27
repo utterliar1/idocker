@@ -535,12 +535,214 @@ _code, _, _b = raw_req("/api/login",
 ok("连续输错达上限后临时锁定，正确密码也先挡住",
    _code == 401 and "次数过多" in _b, (_code, _b[:60]))
 server._login_fails.clear()
+os.environ["AUTH_PASS"] = "s3cret-pw"
 _code, _h, _ = raw_req("/api/login",
                        form={"username": "admin", "password": "s3cret-pw", "next": "/"})
 ok("解除锁定后能正常登录", _code == 302 and "set-cookie" in _h, _code)
 
+# 非 ASCII 密码：hmac.compare_digest 不接受含非 ASCII 字符的 str，会抛
+# TypeError → 登录页 500、Basic 认证永久失败。修复办法是比对前统一 encode。
+server._login_fails.clear()
+os.environ["AUTH_PASS"] = "密码123"
+_code, _h, _b = raw_req("/api/login",
+                        form={"username": "admin", "password": "密码123", "next": "/"})
+ok("中文密码也能登录成功（不再 500）",
+   _code == 302 and "set-cookie" in _h, (_code, _b[:60]))
+ok("中文密码通过 Basic 认证也能过",
+   raw_req("/api/health", basic=("admin", "密码123"))[0] == 200)
+ok("中文密码错误照样被拒",
+   raw_req("/api/health", basic=("admin", "不是这个"))[0] == 401)
+os.environ["AUTH_PASS"] = "s3cret-pw"
+
+# 只设账号、不设密码 = 配置错误，必须 fail-closed（否则空密码即可登录）
+server._login_fails.clear()
+os.environ.pop("AUTH_PASS", None)
+_code, _h, _b = raw_req("/api/login",
+                        form={"username": "admin", "password": "", "next": "/"})
+ok("只设账号不设密码时拒绝登录（不留空密码后门）", _code == 401, (_code, _b[:60]))
+ok("空密码 Basic 也不放行",
+   raw_req("/api/health", basic=("admin", ""))[0] == 401)
+os.environ["AUTH_PASS"] = "s3cret-pw"
+server._login_fails.clear()
+
 os.environ.pop("AUTH_USER", None)
 os.environ.pop("AUTH_PASS", None)
+
+print("\n=== 18. 多标签镜像：等待下载必须能识别逗号分隔 tag ===")
+# 爱快镜像条目的 tag 实测是逗号分隔多标签（如 "1.37.3,latest"）。wait_for_image
+# 若用字符串精确匹配，就会把「镜像早就在本地」误判成「还没下载完」，
+# 白等整个超时周期后失败 —— vaultwarden 就是被这一点卡住的。
+mock_router.FAKE.images.append({
+    "name": "testrepo/multi", "tag": "2.5.0,latest", "id": mock_router.NEW_ID,
+    "install": int(time.time()), "created": int(time.time()),
+    "size": 4096, "namespace": "testrepo", "containers": [],
+})
+_t18 = time.time()
+_ok18, _note18 = A.wait_for_image(_ik, "testrepo/multi", "latest", since=0,
+                                  timeout=6, ctx=A.Ctx())
+ok("多标签条目能立刻命中，不再白等到超时",
+   _ok18 is True and (time.time() - _t18) < 3,
+   (_ok18, round(time.time() - _t18, 1)))
+
+print("\n=== 19. state.json 并发写不丢记录 ===")
+# 这套持久化是「读整个文件 → 改 → 整个写回」。早期无锁，30 个线程并发写实测
+# 只落盘 1 条、丢了 29 条。加锁后必须一条不丢。
+_STATE_KEYS = 40
+_threads = [threading.Thread(target=server.MANAGER._remember_digest,
+                             args=("concur:%d" % i, "digest-%d" % i, "reg"))
+            for i in range(_STATE_KEYS)]
+for _t in _threads:
+    _t.start()
+for _t in _threads:
+    _t.join()
+with open(os.path.join(DATA, "state.json"), encoding="utf-8") as _f:
+    _st = json.load(_f)
+_have = [k for k in _st if k.startswith("concur:")]
+ok("并发写 %d 条一个都不丢" % _STATE_KEYS, len(_have) == _STATE_KEYS,
+   "落盘 %d/%d" % (len(_have), _STATE_KEYS))
+
+print("\n=== 20. 手动「干跑」不再污染全局（定时任务不会被悄悄变空跑）===")
+server.CFG["dry_run"] = False
+mock_router.FAKE.update_calls = []
+d, _ = req("/api/update", {"containers": ["clash"], "dry_run": True})
+_j20 = wait_job(d["job_id"])
+ok("干跑任务本身没有真的改容器", len(mock_router.FAKE.update_calls) == 0)
+ok("干跑后全局配置没有被写脏（仍为 False）", server.CFG["dry_run"] is False,
+   server.CFG["dry_run"])
+# 紧接着一次「不带 dry 字段」的更新（等同定时任务），必须真的执行
+mock_router.FAKE.update_calls = []
+server.CFG["pull_timeout"] = 20
+_j20b = server.MANAGER.create("update", ["clash"], "7.7.7", auto=False, dry=None)
+_j20b = wait_job(_j20b.id)
+ok("后续不带 dry 的更新仍真实执行（未被干跑传染）",
+   len(mock_router.FAKE.update_calls) == 1, _j20b.get("message"))
+
+print("\n=== 21. 线程起不来时不能把更新功能永久卡死 ===")
+import jobs as _jobs_mod                                    # noqa: E402
+_real_threading = _jobs_mod.threading
+
+
+class _BoomThread(object):
+    def __init__(self, *a, **kw):
+        pass
+
+    def start(self):
+        raise RuntimeError("can't start new thread")
+
+
+class _ThreadingShim(object):
+    """只把 Thread 换成会失败的桩，其余属性（Condition/Lock 等）透传真实模块。"""
+
+    Thread = _BoomThread
+
+    def __getattr__(self, name):
+        return getattr(_real_threading, name)
+
+
+_jobs_mod.threading = _ThreadingShim()
+_raised = False
+try:
+    server.MANAGER.create("update", ["clash"], None, auto=False)
+except RuntimeError:
+    _raised = True
+finally:
+    _jobs_mod.threading = _real_threading
+ok("线程启动失败会抛错", _raised)
+ok("互斥位已回滚，更新功能不会永久卡死", server.MANAGER.is_busy() is False)
+_j21 = server.MANAGER.create("update", ["clash"], "7.7.8", auto=False)
+ok("随后仍能正常提交更新任务", bool(_j21.id) and server.MANAGER.is_busy() is True)
+wait_job(_j21.id)
+
+print("\n=== 22. 检测任务并发保护（复用而非重复打爱快）===")
+import jobs as _jobs2                                       # noqa: E402
+_fake_check = _jobs2.Job("check", [])
+server.MANAGER._check_busy = _fake_check.id
+server.MANAGER.jobs[_fake_check.id] = _fake_check
+try:
+    _reused = server.MANAGER.create("check", [])
+finally:
+    server.MANAGER.jobs.pop(_fake_check.id, None)
+    server.MANAGER._check_busy = None
+ok("已有检测在跑时复用同一个任务（不重复打爱快和加速源）", _reused is _fake_check)
+
+print("\n=== 23. 登录失败记录表不会无界增长 ===")
+server._login_fails.clear()
+for _i in range(server.LOGIN_FAILS_MAX_KEYS + 50):
+    server._login_fails["10.%d.%d.%d" % (_i // 65025, (_i // 255) % 255, _i % 255)] = \
+        {"n": 0, "until": 0}
+server.note_login_fail("9.9.9.9")
+ok("过期记录被清理，表大小有上限",
+   len(server._login_fails) <= server.LOGIN_FAILS_MAX_KEYS + 1,
+   len(server._login_fails))
+server._login_fails.clear()
+
+print("\n=== 24. 写盘失败不再静默吞掉 ===")
+import io as _io                                            # noqa: E402
+_real_state_path = server.MANAGER._state_path
+server.MANAGER._state_path = lambda: os.path.join(DATA, "no_such_dir", "state.json")
+_buf = _io.StringIO()
+_old_err = sys.stderr
+sys.stderr = _buf
+try:
+    server.MANAGER._remember_digest("boom:1", "d", "r")
+finally:
+    sys.stderr = _old_err
+    server.MANAGER._state_path = _real_state_path
+ok("写盘失败会留下告警（可在 docker logs 里看到）",
+   "写入失败" in _buf.getvalue(), _buf.getvalue()[:80])
+
+print("\n=== 25. 请求体大小上限 ===")
+_real_max = server.MAX_BODY_BYTES
+server.MAX_BODY_BYTES = 100
+try:
+    _code, _, _ = raw_req("/api/update",
+                          json_body={"containers": ["clash"], "pad": "x" * 500})
+finally:
+    server.MAX_BODY_BYTES = _real_max
+ok("超大请求体被拒绝(413)", _code == 413, _code)
+
+print("\n=== 27. 静态资源不能穿越到 static 目录之外 ===")
+import http.client                                          # noqa: E402
+_sib = os.path.normpath(os.path.join(server.STATIC_DIR, "..", "static-evil"))
+os.makedirs(_sib, exist_ok=True)
+with open(os.path.join(_sib, "probe.txt"), "w", encoding="utf-8") as _f:
+    _f.write("PWNED")
+try:
+    _conn = http.client.HTTPConnection("127.0.0.1", HTTP.server_address[1], timeout=10)
+    _conn.request("GET", "/static/../static-evil/probe.txt")
+    _resp = _conn.getresponse()
+    _body27 = _resp.read().decode("utf-8", "replace")
+    _code27 = _resp.status
+    _conn.close()
+finally:
+    shutil.rmtree(_sib, ignore_errors=True)
+ok("前缀相同的兄弟目录也挡住（commonpath 生效）",
+   _code27 == 404 and "PWNED" not in _body27, (_code27, _body27[:40]))
+
+print("\n=== 28. 跨站写请求被拒（Origin 校验）===")
+_r28 = urllib.request.Request(BASE + "/api/update",
+                              data=json.dumps({"containers": ["clash"]}).encode(),
+                              method="POST")
+_r28.add_header("Content-Type", "application/json")
+_r28.add_header("Origin", "http://evil.example.com")
+try:
+    with urllib.request.urlopen(_r28, timeout=15) as _resp28:
+        _code28 = _resp28.status
+except urllib.error.HTTPError as _e28:
+    _code28 = _e28.code
+ok("带站外 Origin 的写请求被拒(403)", _code28 == 403, _code28)
+
+_r28b = urllib.request.Request(BASE + "/api/update", data=b"{}", method="POST")
+_r28b.add_header("Content-Type", "application/json")
+_r28b.add_header("Origin", BASE)
+try:
+    with urllib.request.urlopen(_r28b, timeout=15) as _resp28b:
+        _code28b = _resp28b.status
+except urllib.error.HTTPError as _e28b:
+    _code28b = _e28b.code
+ok("同源 Origin 正常放行（不是 403）", _code28b != 403, _code28b)
+ok("不带 Origin 的脚本请求照旧放行（不是 403）",
+   raw_req("/api/check", json_body={})[0] != 403)
 
 print("\n" + "=" * 56)
 print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))

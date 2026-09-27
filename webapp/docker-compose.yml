@@ -25,7 +25,7 @@ services:
     # 想跳过本地构建、直接用 CI 产出的官方镜像，就注释掉上面的 build:，
     # 并把下面这行换成：
     #   image: ghcr.io/utterliar1/idocker:latest
-    image: idocker:1.4.0
+    image: idocker:1.4.1
     container_name: idocker
     restart: unless-stopped
 

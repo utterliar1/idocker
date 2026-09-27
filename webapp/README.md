@@ -102,7 +102,7 @@ docker compose logs -f              # 看到启动横幅即成功，Ctrl+C 退�
 |---|---|
 | `latest` | main 分支每次推送 |
 | `sha-xxxxxxx` | 每次构建，钉住具体 commit |
-| `1.4.0`、`1.4` | 推 `v1.4.0` 这样的 tag 时 |
+| `1.4.1`、`1.4` | 推 `v1.4.1` 这样的 tag 时 |
 
 > 拉不动 ghcr.io 的话，给镜像名加个加速前缀即可，例如
 > `docker.1ms.run/ghcr.io/utterliar1/idocker:latest`。
@@ -484,8 +484,8 @@ push / PR
 发新版本就是打个 tag：
 
 ```bash
-git tag v1.4.0 && git push origin v1.4.0
-# → ghcr.io/utterliar1/idocker:1.4.0 / :1.4 / :latest / :sha-xxxxxxx
+git tag v1.4.1 && git push origin v1.4.1
+# → ghcr.io/utterliar1/idocker:1.4.1 / :1.4 / :latest / :sha-xxxxxxx
 ```
 
 推送 ghcr.io 用的是仓库自带的 `GITHUB_TOKEN`（workflow 里声明了 `packages: write`），

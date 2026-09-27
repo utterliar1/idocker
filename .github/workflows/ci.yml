@@ -59,13 +59,13 @@ jobs:
       - name: 全量语法自检
         run: python -m compileall -q webapp/app _test
 
-      - name: 后端回归（假爱快 + 真 server，110 项）
+      - name: 后端回归（假爱快 + 真 server，131 项）
         run: python _test/test_webapp.py
 
       - name: 前端回归 · 自动刷新（DOM 桩跑真 app.js，24 项）
         run: node _test/test_frontend.js
 
-      - name: 前端回归 · 交互与状态呈现（DOM 桩跑真 app.js，36 项）
+      - name: 前端回归 · 交互与状态呈现（DOM 桩跑真 app.js，39 项）
         run: node _test/test_frontend_ux.js
 
   # ------------------------------------------------------------

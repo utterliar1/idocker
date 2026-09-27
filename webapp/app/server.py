@@ -52,7 +52,7 @@ import jobs as J               # noqa: E402
 import scheduler as SC         # noqa: E402
 import store as S              # noqa: E402
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 CFG = A.load_config()
 MANAGER = J.JobManager(CFG)
 # 持久化设置：页面里改的下载超时、定时任务都落在这里（Docker 卷 /data）
@@ -102,13 +102,32 @@ COOKIE_NAME = "idocker_session"
 SESSION_TTL = 7 * 24 * 3600        # 登录状态保持 7 天，期间免登录
 LOGIN_MAX_FAILS = 5                # 同一来源连续失败次数上限
 LOGIN_LOCK_SECONDS = 60            # 触发上限后锁多久
+LOGIN_FAILS_MAX_KEYS = 512         # 失败记录表最多保留多少个来源，防无界增长
+MAX_BODY_BYTES = 1 << 20           # 请求体上限 1 MiB，挡住超大 Content-Length 打满内存
 
 _login_fails = {}                  # ip -> {"n": 失败次数, "until": 解锁时间戳}
 _login_lock = threading.Lock()
 
 
+def _digest_eq(a, b):
+    """定长比较，且先统一编码为 bytes。
+
+    为什么要编码：``hmac.compare_digest`` 不接受含非 ASCII 字符的 ``str``，
+    会直接抛 ``TypeError: comparing strings with non-ASCII characters``。
+    密码里带中文 / emoji 时，登录页会 500、Basic 认证会永远失败。
+    编成 UTF-8 bytes 后比较的是同样的字节序列，安全性不变。
+    """
+    return hmac.compare_digest(str(a if a is not None else "").encode("utf-8"),
+                               str(b if b is not None else "").encode("utf-8"))
+
+
 def auth_enabled():
     return bool(os.environ.get("AUTH_USER") or "")
+
+
+def auth_misconfigured():
+    """开了账号却没设密码 —— 必须 fail-closed，否则空密码就能登录。"""
+    return auth_enabled() and not (os.environ.get("AUTH_PASS") or "")
 
 
 def _session_secret():
@@ -180,11 +199,23 @@ def login_locked_for(ip):
 
 
 def note_login_fail(ip):
+    now = time.time()
     with _login_lock:
+        # 顺手清理：过期且未在锁定期内的记录直接删掉；表太大时按最旧淘汰。
+        # 否则这个字典只增不减，反代场景下所有请求同一 IP，问题更明显。
+        if len(_login_fails) >= LOGIN_FAILS_MAX_KEYS:
+            for k, v in list(_login_fails.items()):
+                if v.get("until", 0) < now and not v.get("n"):
+                    _login_fails.pop(k, None)
+            while len(_login_fails) > LOGIN_FAILS_MAX_KEYS:
+                oldest = min(_login_fails.items(), key=lambda kv: kv[1].get("until", 0))[0]
+                if oldest == ip:
+                    break
+                _login_fails.pop(oldest, None)
         rec = _login_fails.setdefault(ip, {"n": 0, "until": 0})
         rec["n"] += 1
         if rec["n"] >= LOGIN_MAX_FAILS:
-            rec["until"] = time.time() + LOGIN_LOCK_SECONDS
+            rec["until"] = now + LOGIN_LOCK_SECONDS
             rec["n"] = 0
         return rec
 
@@ -310,12 +341,16 @@ class Handler(BaseHTTPRequestHandler):
             return True
         want_user = os.environ.get("AUTH_USER") or ""
         want_pass = os.environ.get("AUTH_PASS") or ""
+        # 只设了账号没设密码 = 配置错误。必须拒绝一切登录（fail-closed），
+        # 否则 compare_digest("", "") 为真 → 空密码即可进入。
+        if not want_pass:
+            return False
 
         # 1) 会话 cookie —— 登录页表单写入的，浏览器会自动带上
         token = parse_cookies(self.headers.get("Cookie")).get(COOKIE_NAME)
         if token:
             user = read_session_token(token)
-            if user and hmac.compare_digest(user, want_user):
+            if user and _digest_eq(user, want_user):
                 return True
 
         # 2) 仍然接受 Basic 头：curl、脚本、旧书签、CI 都不受影响
@@ -324,12 +359,27 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 raw = base64.b64decode(header[6:]).decode("utf-8", "replace")
                 user, _, pw = raw.partition(":")
-                if (hmac.compare_digest(user, want_user)
-                        and hmac.compare_digest(pw, want_pass)):
+                if _digest_eq(user, want_user) and _digest_eq(pw, want_pass):
                     return True
             except Exception:                                   # noqa: BLE001
                 return False
         return False
+
+    def _csrf_ok(self):
+        """对状态变更请求做最轻量的 CSRF 加固。
+
+        真正的防线是 cookie 的 SameSite=Lax（跨站发起的表单/POST 不会带 cookie）。
+        这里再加一道：**只要浏览器带了 Origin 头**，就必须与本机 Host 同源。
+        curl / 脚本不带 Origin，照旧放行，不影响自动化。
+        """
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        try:
+            host = urllib.parse.urlparse(origin).netloc
+        except Exception:                                       # noqa: BLE001
+            return False
+        return host == (self.headers.get("Host") or "").strip()
 
     # -- 认证相关的响应工具 ----------------------------------------
     def _send_html(self, body, status=200):
@@ -375,14 +425,32 @@ class Handler(BaseHTTPRequestHandler):
     def _is_json_client(self):
         return (self.headers.get("Content-Type") or "").lower().startswith("application/json")
 
+    def _read_body_bytes(self):
+        """读请求体，并挡住超大 Content-Length（否则可被打满内存）。"""
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            return b""
+        if length > MAX_BODY_BYTES:
+            raise ApiError("请求体过大", 413)
+        return self.rfile.read(length)
+
     def _do_login(self):
+        # 登录在 do_POST 的主 try 之外，任何未捕获异常都会变成 500 + traceback。
+        # 这里自带兜底（早期实测：非法 Content-Length 会让它直接 500）。
+        try:
+            return self._do_login_inner()
+        except ApiError as e:
+            return self._send_error_json(e.message, e.status)
+        except Exception as e:                                  # noqa: BLE001
+            return self._send_error_json("登录处理失败：%s: %s" % (type(e).__name__, e), 500)
+
+    def _do_login_inner(self):
         ip = self._client_ip()
         left = login_locked_for(ip)
         if left:
             return self._login_failed(ip, "尝试次数过多，请 %d 秒后再试" % left, count=False)
 
-        length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length) if length > 0 else b""
+        raw = self._read_body_bytes()
         if self._is_json_client():
             try:
                 data = json.loads(raw.decode("utf-8") or "{}")
@@ -402,8 +470,8 @@ class Handler(BaseHTTPRequestHandler):
 
         want_user = os.environ.get("AUTH_USER") or ""
         want_pass = os.environ.get("AUTH_PASS") or ""
-        if (hmac.compare_digest(user, want_user)
-                and hmac.compare_digest(pw, want_pass)):
+        # 配置错误（有账号无密码）：一律拒绝，绝不放空密码进来
+        if (want_pass and _digest_eq(user, want_user) and _digest_eq(pw, want_pass)):
             clear_login_fails(ip)
             self.send_response(302)
             self._set_session_cookie(user)
@@ -451,10 +519,9 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json({"ok": False, "error": str(message)}, status=status)
 
     def _read_json_body(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0:
+        raw = self._read_body_bytes()
+        if not raw:
             return {}
-        raw = self.rfile.read(length)
         try:
             return json.loads(raw.decode("utf-8"))
         except ValueError:
@@ -463,7 +530,13 @@ class Handler(BaseHTTPRequestHandler):
     def _serve_static(self, relpath):
         relpath = relpath.lstrip("/") or "index.html"
         target = os.path.normpath(os.path.join(STATIC_DIR, relpath))
-        if not target.startswith(STATIC_DIR) or not os.path.isfile(target):
+        # 用 commonpath 而不是 startswith：后者会把 /static-evil 这类
+        # 前缀相同的兄弟目录也放进来（当前调用方式虽逃不出，但属加固）。
+        try:
+            inside = os.path.commonpath([target, STATIC_DIR]) == STATIC_DIR
+        except ValueError:                     # 不同盘符（Windows）
+            inside = False
+        if not inside or not os.path.isfile(target):
             self._send_error_json("资源不存在", 404)
             return
         with open(target, "rb") as f:
@@ -556,6 +629,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._do_logout()
         if not self._auth_ok():
             return self._deny()
+        if not self._csrf_ok():
+            return self._send_error_json("跨站请求被拒绝", 403)
         try:
             body = self._read_json_body()
             if path == "/api/check":
@@ -568,13 +643,12 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError("请至少选择一个容器")
                 if MANAGER.is_busy():
                     raise ApiError("已有更新任务在执行，请等它跑完再试", 409)
-                # 干跑开关由前端传入；任务按执行时的配置读取，每次请求覆盖一次。
-                # 定时任务不带这个字段，因此沿用当前配置，不会偷改用户的选择。
-                if "dry_run" in body:
-                    CFG["dry_run"] = bool(body.get("dry_run"))
+                # 干跑开关随本次任务下发，**不再写全局 CFG** —— 否则用户手动勾
+                # 一次干跑，此后所有定时任务都会静默变成空跑（界面还显示已完成）。
+                dry = bool(body.get("dry_run")) if "dry_run" in body else None
                 tag = (body.get("tag") or "").strip() or None
                 try:
-                    job = MANAGER.create("update", names, tag)
+                    job = MANAGER.create("update", names, tag, dry=dry)
                 except J.BusyError as e:
                     raise ApiError(str(e), 409)
                 return self._send_json({"ok": True, "job_id": job.id})
@@ -757,6 +831,9 @@ def main():
     print("  访问认证    %s" % ("登录页（账号 %s）" % os.environ["AUTH_USER"]
                               if auth_enabled() else "关闭"), flush=True)
     print("=" * 62, flush=True)
+    if auth_misconfigured():
+        print("⚠ 已设置 AUTH_USER 但未设置 AUTH_PASS：出于安全一律拒绝登录，"
+              "请补上 AUTH_PASS 后重启容器", flush=True)
     if not CFG["router"]["url"]:
         print("⚠ 未配置 IKUAI_URL，页面能打开但无法读取容器", flush=True)
 

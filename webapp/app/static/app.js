@@ -327,7 +327,18 @@
     }, 700);
   }
 
+  // 清理选中态里已经消失的容器名。容器被删掉/改名后，旧键会残留在
+  // state.selected 里 —— 点「更新选中」就会对不存在的容器发请求（后端报找不到）。
+  function pruneSelection() {
+    var alive = {};
+    state.containers.forEach(function (c) { alive[c.name] = true; });
+    Object.keys(state.selected).forEach(function (k) {
+      if (!alive[k]) delete state.selected[k];
+    });
+  }
+
   function renderContainers() {
+    pruneSelection();
     var tb = $("ctBody");
     var html;
     if (!state.containers.length) {

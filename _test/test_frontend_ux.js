@@ -358,6 +358,40 @@ function boot(opts) {
        app.el("updStat").textContent);
   }
 
+  /* ============================================================ */
+  console.log("\n=== H. 容器消失后选中态不残留（不对幽灵容器发请求）===");
+  {
+    const app = boot({ search: "?autorefresh=5&autocheck=0" });
+    await sleep(150);
+    app.el("checkAll").checked = true;
+    app.el("checkAll")._listeners.change.forEach((fn) => fn.call(app.el("checkAll")));
+    await sleep(50);
+    ok("全选后显示 3 个选中",
+       app.el("btnUpdateSelected").textContent === "更新选中 (3)",
+       app.el("btnUpdateSelected").textContent);
+
+    // 模拟 clash 被删掉，然后手动刷新总览
+    const idx = CONTAINERS.findIndex((c) => c.name === "clash");
+    const removed = CONTAINERS.splice(idx, 1)[0];
+    app.el("btnRefresh").click();
+    await sleep(200);
+    ok("容器消失后选中数自动收缩为 2（残留键被清掉）",
+       app.el("btnUpdateSelected").textContent === "更新选中 (2)",
+       app.el("btnUpdateSelected").textContent);
+
+    const before = app.calls("/api/update").length;
+    app.el("btnUpdateSelected").click();
+    await sleep(50);
+    app.el("cfmOk").click();
+    await sleep(120);
+    const calls = app.calls("/api/update");
+    ok("更新请求只含仍存在的容器，不含已删除的 clash",
+       calls.length === before + 1 &&
+       calls[calls.length - 1].body.containers.indexOf("clash") < 0,
+       calls.length && calls[calls.length - 1].body);
+    CONTAINERS.splice(idx, 0, removed);      // 还原，避免影响其他用例
+  }
+
   console.log("\n----------------------------------------");
   console.log("通过 " + PASS + " 项，失败 " + FAIL + " 项");
   process.exit(FAIL ? 1 : 0);

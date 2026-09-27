@@ -142,6 +142,10 @@ class IKuai(object):
         self.host = host
         self.base = scheme + "://" + host
         self.timeout = int(cfg.get("timeout", 20))
+        # ⚠ 刻意关闭证书校验：爱快后台用的是自签证书，内网直连时无法通过 CA 校验，
+        #   不开就只能连不上。代价是这条链路对 MITM 不设防 —— 因此本工具只应部署
+        #   在受信任的局域网内，不要把它暴露到公网。若爱快换了可信证书，
+        #   应改回 create_default_context() 的默认校验。
         sctx = ssl.create_default_context()
         sctx.check_hostname = False
         sctx.verify_mode = ssl.CERT_NONE
@@ -554,7 +558,10 @@ def wait_for_image(ik, repo, tag, since, timeout, ctx):
     last_left = None
     while time.time() < deadline:
         for i in get_local_images(ik):
-            if i.get("name") == repo and str(i.get("tag")) == str(tag):
+            # 爱快镜像条目的 tag 可能是逗号分隔多标签（如 "1.37.3,latest"），
+            # 不能用字符串精确匹配 —— 否则「镜像早就在本地」也会被判定为
+            # 「没下载完」，白等整个超时周期后失败（实测 vaultwarden 就是）。
+            if i.get("name") == repo and tag_matches(i.get("tag"), tag):
                 if (i.get("install") or 0) >= since:
                     return True, i
                 note = "镜像已存在但拉取时间未更新（可能本来就是最新）"

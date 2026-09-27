@@ -7,11 +7,28 @@
 
 import json
 import os
+import sys
 import threading
 import time
 import uuid
 
 import ikuai_api as A
+
+# 持久化（history.json / state.json / last_check.json）统一用这把锁保护。
+# 这三处都是「读整个文件 → 改 → 整个写回」，而 check 任务与 update 任务可以
+# 并发跑（多个标签页、自动检测与手动点击重叠），没有锁就会互相覆盖、静默丢记录。
+# 注意：写盘本身用临时文件 + os.replace 保证原子性，但不能防住「读-改-写」整段
+# 竞态，所以必须在整段上加锁。
+_persist_lock = threading.RLock()
+
+
+def _warn(message):
+    """写盘等非致命错误不再静默吞掉 —— 至少要能在 docker logs 里看到。"""
+    try:
+        sys.stderr.write("[idocker] %s\n" % message)
+        sys.stderr.flush()
+    except Exception:                                         # noqa: BLE001
+        pass
 
 # 更新流程的六个步骤（前端按这个顺序画流程图）
 UPDATE_STEPS = [
@@ -40,7 +57,7 @@ class BusyError(Exception):
 
 
 class Job(object):
-    def __init__(self, kind, targets, tag=None, auto=False, schedule_id=""):
+    def __init__(self, kind, targets, tag=None, auto=False, schedule_id="", dry=None):
         self.id = uuid.uuid4().hex[:12]
         self.kind = kind                    # 'update' | 'check'
         self.targets = list(targets)
@@ -49,6 +66,11 @@ class Job(object):
         # 上游没变就直接跳过，不拉取、不重启容器。手动点击更新时 auto=False，
         # 用户意图是「现在就更新」，就按原样走完整流程。
         self.auto = bool(auto)
+        # 干跑开关**跟着任务走**，绝不写全局配置。dry 为 None 时（定时任务 /
+        # 不带该字段的请求）回退到环境变量 DRY_RUN 的默认值。早期版本把
+        # 手动请求里的 dry_run 写进全局 CFG，导致用户勾一次干跑后，此后所有
+        # 定时任务都静默变成空跑 —— 界面上还显示「已完成」，没有任何提示。
+        self.dry = None if dry is None else bool(dry)
         self.schedule_id = schedule_id or ""
         self.created = time.time()
         self.finished = False
@@ -115,6 +137,7 @@ class JobManager(object):
         self.order = []
         self._lock = threading.Lock()
         self._busy = None                 # 正在执行的更新任务 id（同时只允许一个）
+        self._check_busy = None           # 正在执行的检测任务 id（同时只允许一个）
         self._finish_hook = None          # 任务结束回调，调度器用它回写结果
         self.data_dir = cfg.get("data_dir") or "/data"
         try:
@@ -170,38 +193,66 @@ class JobManager(object):
         return None
 
     def _save_history(self, job):
-        self.history.insert(0, {
-            "id": job.id, "kind": job.kind, "targets": job.targets, "tag": job.tag,
-            "created": job.created, "ok": job.ok,
-            "finished_at": time.time(), "steps": job.steps,
-            "message": job.final_message or "",
-            "logs": self._extract_logs(job),
-        })
-        del self.history[HISTORY_LIMIT:]
-        try:
-            tmp = self.history_path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.history, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, self.history_path)
-        except Exception:
-            pass
+        with _persist_lock:
+            self.history.insert(0, {
+                "id": job.id, "kind": job.kind, "targets": job.targets, "tag": job.tag,
+                "created": job.created, "ok": job.ok,
+                "finished_at": time.time(), "steps": job.steps,
+                "message": job.final_message or "",
+                "logs": self._extract_logs(job),
+            })
+            del self.history[HISTORY_LIMIT:]
+            try:
+                tmp = self.history_path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(self.history, f, ensure_ascii=False, indent=2)
+                os.replace(tmp, self.history_path)
+            except Exception as e:                            # noqa: BLE001
+                _warn("历史记录写入失败（%s）：%s" % (self.history_path, e))
 
     # -- 生命周期 --------------------------------------------------
-    def create(self, kind, targets, tag=None, auto=False, schedule_id=""):
-        job = Job(kind, targets, tag, auto=auto, schedule_id=schedule_id)
+    def create(self, kind, targets, tag=None, auto=False, schedule_id="", dry=None):
         with self._lock:
             # 更新任务互斥：两个任务同时改容器会互相打断，也会让「验证」拿错状态
             if kind == "update":
                 if self._busy:
                     raise BusyError("已有更新任务在执行，请等它跑完再试")
+            # 检测任务也互斥：多个标签页 / 自动检测与手动点击重叠时会重复打
+            # 爱快和加速源；而且 check 与 update 并发写 state.json 更容易撞车。
+            # 策略是「复用」而不是「拒绝」—— 前端拿到的还是同一个 job id，
+            # 照样能订阅，不会报错打断用户。
+            elif kind == "check":
+                cur = self.jobs.get(self._check_busy) if self._check_busy else None
+                if cur is not None and not cur.finished:
+                    return cur
+
+            job = Job(kind, targets, tag, auto=auto, schedule_id=schedule_id, dry=dry)
+            if kind == "update":
                 self._busy = job.id
+            else:
+                self._check_busy = job.id
             self.jobs[job.id] = job
             self.order.append(job.id)
             while len(self.order) > HISTORY_LIMIT:
                 old = self.order.pop(0)
                 self.jobs.pop(old, None)
-        t = threading.Thread(target=self._run, args=(job,), daemon=True)
-        t.start()
+        # 线程创建/启动可能失败（典型：can't start new thread）。若不回滚，
+        # 互斥位会永远悬着 —— 更新功能就此永久失效，只能重启容器恢复。
+        try:
+            t = threading.Thread(target=self._run, args=(job,), daemon=True)
+            t.start()
+        except Exception:
+            with self._lock:
+                if kind == "update" and self._busy == job.id:
+                    self._busy = None
+                elif kind == "check" and self._check_busy == job.id:
+                    self._check_busy = None
+                self.jobs.pop(job.id, None)
+                try:
+                    self.order.remove(job.id)
+                except ValueError:
+                    pass
+            raise
         return job
 
     def get(self, jid):
@@ -227,6 +278,10 @@ class JobManager(object):
                 with self._lock:
                     if self._busy == job.id:
                         self._busy = None
+            else:
+                with self._lock:
+                    if self._check_busy == job.id:
+                        self._check_busy = None
             job.finish(ok, msg)
             self._save_history(job)
             hook = self._finish_hook
@@ -325,7 +380,9 @@ class JobManager(object):
                 job.log("容器声明了 %d 个端口但未做宿主映射（doc_docker 路由直连，属正常）"
                         % unmapped, level="warn")
             since = int(time.time())
-            dry = bool(cfg.get("dry_run"))
+            # 干跑开关跟随本次任务：手动请求传来什么就是什么；定时任务没传，
+            # 回退到环境变量 DRY_RUN 的默认值。绝不读/写全局可变状态。
+            dry = job.dry if job.dry is not None else bool(cfg.get("dry_run"))
             already = False
             # 拉取前先记下本地镜像的内容指纹（镜像 ID）
             sig_before = "" if dry else A.image_signature(ik, repo, new_tag)
@@ -565,31 +622,34 @@ class JobManager(object):
         payload = {"checked_at": time.time(),
                    "at_str": time.strftime("%Y-%m-%d %H:%M:%S"),
                    "items": items}
-        try:
-            tmp = self._last_check_path() + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, self._last_check_path())
-        except Exception:
-            pass
+        with _persist_lock:
+            try:
+                tmp = self._last_check_path() + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
+                os.replace(tmp, self._last_check_path())
+            except Exception as e:                            # noqa: BLE001
+                _warn("上次检测结果写入失败：%s" % e)
 
     def last_check(self):
-        try:
-            with open(self._last_check_path(), "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {"checked_at": 0, "at_str": "", "items": {}}
+        with _persist_lock:
+            try:
+                with open(self._last_check_path(), "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return {"checked_at": 0, "at_str": "", "items": {}}
 
     # -- digest 记忆 -------------------------------------------------
     def _state_path(self):
         return os.path.join(self.data_dir, "state.json")
 
     def _load_state(self):
-        try:
-            with open(self._state_path(), "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
+        with _persist_lock:
+            try:
+                with open(self._state_path(), "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return {}
 
     def _seen_digest(self, key):
         return (self._load_state().get(key) or {}).get("digest")
@@ -604,13 +664,16 @@ class JobManager(object):
             self._remember_digest(key, digest, reg)
 
     def _remember_digest(self, key, digest, reg):
-        st = self._load_state()
-        st[key] = {"digest": digest, "registry": reg,
-                   "checked_at": time.strftime("%Y-%m-%d %H:%M:%S")}
-        try:
-            tmp = self._state_path() + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(st, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, self._state_path())
-        except Exception:
-            pass
+        # 整段「读-改-写」必须加锁：check 与 update 可并发，多个标签页也能同时
+        # 触发检测。早期无锁实测 30 个线程各写一个 key，落盘只剩 1 条、丢了 29 条。
+        with _persist_lock:
+            st = self._load_state()
+            st[key] = {"digest": digest, "registry": reg,
+                       "checked_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+            try:
+                tmp = self._state_path() + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(st, f, ensure_ascii=False, indent=2)
+                os.replace(tmp, self._state_path())
+            except Exception as e:                            # noqa: BLE001
+                _warn("digest 记忆写入失败：%s" % e)
