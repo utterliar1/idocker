@@ -9,6 +9,7 @@
 用法：python _test/test_webapp.py
 """
 import base64
+import faulthandler
 import json
 import os
 import shutil
@@ -19,6 +20,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+# 万一解释器在退出阶段崩了，让它把栈打出来，而不是只留一个 exit code 139。
+faulthandler.enable()
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP = os.path.join(HERE, "..", "webapp", "app")
@@ -742,7 +746,22 @@ except urllib.error.HTTPError as _e28b:
     _code28b = _e28b.code
 ok("同源 Origin 正常放行（不是 403）", _code28b != 403, _code28b)
 ok("不带 Origin 的脚本请求照旧放行（不是 403）",
-   raw_req("/api/check", json_body={})[0] != 403)
+   raw_req("/api/settings", json_body={})[0] != 403)
+
+# ---- 收尾：把还在跑的任务等完、把两个 HTTP 服务关掉再退出 ----
+# 否则守护线程会在解释器最终化时被硬杀，容易在退出阶段炸掉（CI 上实测 exit 139，
+# 而 131 项断言其实全过了 —— 问题出在收尾，不是测试本身）。
+_t_drain = time.time()
+while time.time() - _t_drain < 30:
+    if all(j.finished for j in list(server.MANAGER.jobs.values())):
+        break
+    time.sleep(0.2)
+for _srv_obj in (HTTP, _srv):
+    try:
+        _srv_obj.shutdown()
+        _srv_obj.server_close()
+    except Exception:                                       # noqa: BLE001
+        pass
 
 print("\n" + "=" * 56)
 print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
