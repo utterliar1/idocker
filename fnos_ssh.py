@@ -3,7 +3,8 @@
 """飞牛 fnOS 远程执行助手。
 
 从项目根目录的 .env 读取飞牛地址与凭据（凭据绝不回显），
-通过 paramiko 登录并执行命令；已带 sudo 前缀的命令会自动补密码。
+通过 paramiko 登录并执行命令；默认校验 known_hosts 中的主机密钥，已带 sudo 前缀的命令会自动补密码。
+首次连接请先把可信主机指纹写入用户 known_hosts，或在 .env 中显式设置 FN_KNOWN_HOSTS / FN_AUTO_ADD_HOST_KEY。
 
 用法：
     python fnos_ssh.py "docker ps"                  # 单条
@@ -26,8 +27,8 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV_CANDIDATES = [
-    os.path.join(HERE, "..", ".env"),
     os.path.join(HERE, ".env"),
+    os.path.join(HERE, "..", ".env"),
 ]
 
 import paramiko  # noqa: E402
@@ -68,7 +69,15 @@ def parse_target(raw):
 def connect(env, timeout=20):
     host, port = parse_target(env["fn_url"])
     cli = paramiko.SSHClient()
-    cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    known_hosts = env.get("fn_known_hosts") or env.get("FN_KNOWN_HOSTS") or os.path.expanduser("~/.ssh/known_hosts")
+    if os.path.exists(known_hosts):
+        cli.load_host_keys(known_hosts)
+    cli.load_system_host_keys()
+    auto_add = env.get("fn_auto_add_host_key") or env.get("FN_AUTO_ADD_HOST_KEY") or ""
+    if auto_add.lower() in ("1", "true", "yes"):
+        cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    else:
+        cli.set_missing_host_key_policy(paramiko.RejectPolicy())
     cli.connect(hostname=host, port=port, username=env["fn_id"],
                 password=env["fn_pw"], timeout=timeout,
                 allow_agent=False, look_for_keys=False)

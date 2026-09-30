@@ -103,10 +103,13 @@ class Scheduler(threading.Thread):
 
     # -- 任务结束回调（由 JobManager 调用）---------------------------
     def on_job_finish(self, job):
-        sid = getattr(job, "schedule_id", "")
-        if not sid:
+        sids = list(getattr(job, "schedule_ids", []) or [])
+        if not sids:
+            sid = getattr(job, "schedule_id", "")
+            sids = [sid] if sid else []
+        if not sids:
             return
-        if job.ok:
-            self.store.mark_result(sid, "ok", job.final_message or "已完成")
-        else:
-            self.store.mark_result(sid, "fail", job.final_message or "执行失败")
+        status = "ok" if job.ok else "fail"
+        message = job.final_message or ("已完成" if job.ok else "执行失败")
+        for sid in sids:
+            self.store.mark_result(sid, status, message)

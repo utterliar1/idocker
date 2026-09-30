@@ -132,8 +132,15 @@ class Store(object):
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, self.path)
-        except Exception:
-            pass
+            return True
+        except Exception as e:
+            try:
+                import sys
+                sys.stderr.write("[idocker] 设置写入失败（%s）：%s\n" % (self.path, e))
+                sys.stderr.flush()
+            except Exception:
+                pass
+            raise OSError("设置写入失败：%s" % e) from e
 
     @staticmethod
     def _normalize(it):

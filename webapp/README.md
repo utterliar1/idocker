@@ -530,11 +530,13 @@ webapp/
 | `.github/workflows/ci.yml` | **CI 流水线**：验证 → 推 ghcr.io → 冒烟测试，见上一节 |
 | `.gitignore` | 排除 `.env`、运行时状态、`_mine/`（抓来的爱快前端 chunk） |
 | `deploy_webapp.py` | 一键把 `webapp/` 同步到飞牛并重建容器 |
-| `fnos_ssh.py` | 免交互 SSH 到飞牛执行命令（从 `.env` 读凭据、自动 sudo、支持 `--put/--get`） |
+| `fnos_ssh.py` | 免交互 SSH 到飞牛执行命令（从 `.env` 读凭据、校验 known_hosts、自动 sudo、支持 `--put/--get`） |
 | `ikuai_docker_updater.py` | 等价的命令行版（`list` / `check` / `update` / `tags` / `server`） |
 | `API_REFERENCE.md` | 爱快 4.0 Docker 接口完整参考（实测） |
 
 `fnos_ssh.py` 远程部署排错时很顺手：
+
+默认使用本机 `known_hosts` 校验飞牛 SSH 主机密钥，未知主机会被拒绝。首次连接前请先用可信方式确认指纹并写入 `~/.ssh/known_hosts`；如确需一次性自动接受未知密钥，必须显式在本地 `.env` 设置 `FN_AUTO_ADD_HOST_KEY=1`，使用后应立即删除。
 
 ```bash
 python fnos_ssh.py "docker compose ps"

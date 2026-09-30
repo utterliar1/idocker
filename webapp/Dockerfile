@@ -13,7 +13,7 @@ FROM ${BASE_IMAGE}
 
 # 版本号：CI 打 tag 时由 git tag 注入（见 .github/workflows/ci.yml），
 # 本地直接 docker build 时就用下面的默认值。
-ARG APP_VERSION=1.4.0
+ARG APP_VERSION=1.4.1
 
 LABEL org.opencontainers.image.title="idocker" \
       org.opencontainers.image.description="爱快(iKuai) 4.0 Docker 容器更新器，带可视化执行流程" \
@@ -24,12 +24,13 @@ LABEL org.opencontainers.image.title="idocker" \
 # tzdata 用于让容器内时间正确显示（装了才能让 TZ 生效）。
 # Alpine 官方源在国内可能很慢，先尝试国内镜像，全部失败也不影响运行。
 RUN set -eux; \
-    for m in "" "mirrors.ustc.edu.cn" "mirrors.aliyun.com" "mirrors.tuna.tsinghua.edu.cn"; do \
-        if [ -z "$m" ]; then continue; fi; \
+    cp /etc/apk/repositories /tmp/apk.repositories.orig; \
+    for m in "mirrors.ustc.edu.cn" "mirrors.aliyun.com" "mirrors.tuna.tsinghua.edu.cn" "dl-cdn.alpinelinux.org"; do \
+        cp /tmp/apk.repositories.orig /etc/apk/repositories; \
         sed -i "s|dl-cdn.alpinelinux.org|$m|g" /etc/apk/repositories || true; \
         if apk add --no-cache tzdata 2>/dev/null; then echo "tzdata <- $m"; exit 0; fi; \
     done; \
-    sed -i "s|mirrors\..*alpinelinux.org|dl-cdn.alpinelinux.org|g" /etc/apk/repositories || true; \
+    cp /tmp/apk.repositories.orig /etc/apk/repositories; \
     apk add --no-cache tzdata 2>/dev/null || true
 
 ENV PYTHONUNBUFFERED=1 \

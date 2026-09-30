@@ -748,6 +748,46 @@ ok("同源 Origin 正常放行（不是 403）", _code28b != 403, _code28b)
 ok("不带 Origin 的脚本请求照旧放行（不是 403）",
    raw_req("/api/settings", json_body={})[0] != 403)
 
+print("\n=== 29. 敏感容器参数不进入历史日志 ===")
+_safe_job = _jobs_mod.Job("update", ["demo"])
+_safe_job.log("容器参数摘要：镜像=repo:1，环境变量=已保留")
+_safe_logs = _jobs_mod.JobManager._extract_logs(_safe_job)
+ok("历史日志不含环境变量密钥内容", all("API_TOKEN" not in x["message"] and "secret-value" not in x["message"] for x in _safe_logs))
+
+print("\n=== 30. 复用检测任务会回写所有定时计划 ===")
+_fake_check = _jobs_mod.Job("check", [], schedule_id="schedule-a")
+_check_mgr = server.MANAGER
+_check_mgr._check_busy = _fake_check.id
+_check_mgr.jobs[_fake_check.id] = _fake_check
+try:
+    _reused2 = _check_mgr.create("check", [], schedule_id="schedule-b")
+finally:
+    _check_mgr.jobs.pop(_fake_check.id, None)
+    _check_mgr._check_busy = None
+ok("复用检测任务登记第二个计划", _reused2 is _fake_check and "schedule-b" in _fake_check.schedule_ids)
+class _CaptureStore(object):
+    def __init__(self): self.results = []
+    def mark_result(self, sid, status, message): self.results.append((sid, status, message))
+from scheduler import Scheduler as _Scheduler
+_capture = _CaptureStore()
+_fake_check.ok = True
+_fake_check.final_message = "检测完成"
+_Scheduler(_capture, _check_mgr).on_job_finish(_fake_check)
+ok("任务完成时两个计划都收到结果", [x[0] for x in _capture.results] == ["schedule-a", "schedule-b"], _capture.results)
+
+print("\n=== 31. Store 写盘失败会向调用方报告 ===")
+from store import Store as _Store
+_bad_store = _Store(os.path.join(DATA, "store-failure", "settings.json"))
+def _fail_store_save():
+    raise OSError("disk full")
+_bad_store._save = _fail_store_save
+_raised_store = False
+try:
+    _bad_store.set_pull_timeout(600)
+except OSError:
+    _raised_store = True
+ok("设置写盘失败不会伪装成成功", _raised_store)
+
 # ---- 收尾：把还在跑的任务等完、把两个 HTTP 服务关掉再退出 ----
 # 否则守护线程会在解释器最终化时被硬杀，容易在退出阶段炸掉（CI 上实测 exit 139，
 # 而 131 项断言其实全过了 —— 问题出在收尾，不是测试本身）。

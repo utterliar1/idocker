@@ -72,6 +72,7 @@ class Job(object):
         # 定时任务都静默变成空跑 —— 界面上还显示「已完成」，没有任何提示。
         self.dry = None if dry is None else bool(dry)
         self.schedule_id = schedule_id or ""
+        self.schedule_ids = [self.schedule_id] if self.schedule_id else []
         self.created = time.time()
         self.finished = False
         self.ok = None
@@ -91,6 +92,14 @@ class Job(object):
             self.events.append(ev)
             self._cond.notify_all()
         return ev
+
+    def add_schedule_id(self, schedule_id):
+        schedule_id = str(schedule_id or "")
+        if not schedule_id:
+            return
+        with self._cond:
+            if schedule_id not in self.schedule_ids:
+                self.schedule_ids.append(schedule_id)
 
     def log(self, message, level="info"):
         self.emit("log", level=level, message=str(message))
@@ -118,6 +127,7 @@ class Job(object):
             return {"id": self.id, "kind": self.kind, "targets": self.targets,
                     "tag": self.tag, "created": self.created, "finished": self.finished,
                     "ok": self.ok, "auto": self.auto, "schedule_id": self.schedule_id,
+                    "schedule_ids": list(self.schedule_ids),
                     "message": self.final_message,
                     "steps": [dict(s) for s in self.steps],
                     "event_count": len(self.events)}
@@ -224,6 +234,7 @@ class JobManager(object):
             elif kind == "check":
                 cur = self.jobs.get(self._check_busy) if self._check_busy else None
                 if cur is not None and not cur.finished:
+                    cur.add_schedule_id(schedule_id)
                     return cur
 
             job = Job(kind, targets, tag, auto=auto, schedule_id=schedule_id, dry=dry)
@@ -375,7 +386,12 @@ class JobManager(object):
             # 3. 拉镜像
             job.step("pull", "running", "拉取 %s:%s" % (iname, new_tag))
             payload, unmapped = A.container_payload(c, insp, tag=new_tag)
-            job.log("容器参数：%s" % json.dumps(payload, ensure_ascii=False))
+            # 不把 env/cmd 写入普通日志；它们可能包含 API 密钥、密码和内部路径。
+            job.log("容器参数摘要：镜像=%s，挂载=%s，环境变量=%s，启动命令=%s" % (
+                payload.get("image") or "未设置",
+                "已保留" if payload.get("mounts") else "无",
+                "已保留" if payload.get("env") else "无",
+                "已保留" if payload.get("cmd") else "无"))
             if unmapped:
                 job.log("容器声明了 %d 个端口但未做宿主映射（doc_docker 路由直连，属正常）"
                         % unmapped, level="warn")
