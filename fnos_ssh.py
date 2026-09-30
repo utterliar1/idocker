@@ -32,6 +32,26 @@ ENV_CANDIDATES = [
 ]
 
 import paramiko  # noqa: E402
+from paramiko.hostkeys import HostKeyEntry  # noqa: E402
+
+
+def load_known_hosts(client, path):
+    """Load valid entries while ignoring unrelated malformed lines."""
+    if not path or not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line_no, line in enumerate(f, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                entry = HostKeyEntry.from_line(line, line_no)
+            except Exception:
+                continue
+            if not entry or not entry.key:
+                continue
+            for hostname in entry.hostnames:
+                client.get_host_keys().add(hostname, entry.key.get_name(), entry.key)
 
 
 def load_env():
@@ -70,9 +90,12 @@ def connect(env, timeout=20):
     host, port = parse_target(env["fn_url"])
     cli = paramiko.SSHClient()
     known_hosts = env.get("fn_known_hosts") or env.get("FN_KNOWN_HOSTS") or os.path.expanduser("~/.ssh/known_hosts")
-    if os.path.exists(known_hosts):
-        cli.load_host_keys(known_hosts)
-    cli.load_system_host_keys()
+    load_known_hosts(cli, known_hosts)
+    try:
+        cli.load_system_host_keys()
+    except Exception:
+        # 系统 known_hosts 可能含其他工具写入的损坏行；用户指定文件仍已逐行加载。
+        pass
     auto_add = env.get("fn_auto_add_host_key") or env.get("FN_AUTO_ADD_HOST_KEY") or ""
     if auto_add.lower() in ("1", "true", "yes"):
         cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
