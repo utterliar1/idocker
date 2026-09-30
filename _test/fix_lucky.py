@@ -16,7 +16,7 @@
 
 只读预演：python fix_lucky.py
 实际执行：python fix_lucky.py --apply
-凭据从 D:/Documents/WorkBuddy/爱快/.env 读，绝不回显。
+凭据从仓库根目录上一级的 .env 读取，绝不回显。
 """
 import json
 import os
@@ -27,7 +27,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "webapp", "app"))
 
-ENV = os.path.join(os.path.dirname(ROOT), ".env")
+ENV = next((p for p in (os.path.join(ROOT, ".env"), os.path.join(os.path.dirname(ROOT), ".env")) if os.path.isfile(p)), os.path.join(ROOT, ".env"))
 TARGET = "lucky"
 TAG = "2.27.2"
 HOST_DIR = "/docker/ikuai/lucky"

@@ -6,7 +6,7 @@
       容器对象里的 image/tag/id 到底是哪个，本地镜像库里有哪些 tag/ID。
 
 只读：只发 docker_container.show / docker_image.show / docker_server.show。
-凭据从 D:/Documents/WorkBuddy/爱快/.env 读，绝不回显。
+凭据从仓库根目录上一级的 .env 读取，绝不回显。
 """
 import json
 import os
@@ -16,7 +16,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "webapp", "app"))
 
-ENV = os.path.join(os.path.dirname(ROOT), ".env")
+ENV = next((p for p in (os.path.join(ROOT, ".env"), os.path.join(os.path.dirname(ROOT), ".env")) if os.path.isfile(p)), os.path.join(ROOT, ".env"))
 
 
 def load_env():

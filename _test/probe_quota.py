@@ -7,7 +7,7 @@ file_num 硬编码为 1），导致容器可写层受限、进程起不来。
 对照对象是**未被本工具更新过**的容器（clash / ssh / DDNSTO 等）。
 
 只读：只发 docker_container.show（TYPE=data / TYPE=inspect）。
-凭据从 D:/Documents/WorkBuddy/爱快/.env 读，绝不回显。
+凭据从仓库根目录上一级的 .env 读取，绝不回显。
 """
 import json
 import os
@@ -17,7 +17,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "webapp", "app"))
 
-ENV = os.path.join(os.path.dirname(ROOT), ".env")
+ENV = next((p for p in (os.path.join(ROOT, ".env"), os.path.join(os.path.dirname(ROOT), ".env")) if os.path.isfile(p)), os.path.join(ROOT, ".env"))
 
 KEYS = ("file_size", "file_num", "memory", "cpushares", "auto_start",
         "enabled", "interface", "cmd", "env")

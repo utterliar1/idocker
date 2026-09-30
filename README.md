@@ -143,7 +143,7 @@ python ikuai_docker_updater.py update lucky --tag 2.27.2
 
 ```bat
 schtasks /create /tn "iKuai容器自动更新" /sc daily /st 04:00 ^
-  /tr "C:\Path\python.exe D:\Documents\WorkBuddy\爱快\idocker\ikuai_docker_updater.py -y update lucky flatnas"
+  /tr "C:\Path\python.exe D:\Documents\Codex\GitHub\idocker\ikuai_docker_updater.py -y update lucky flatnas"
 ```
 
 ### Linux / NAS crontab
