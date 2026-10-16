@@ -846,6 +846,55 @@ _vw30 = [c for c in mock_router.FAKE.containers if c["name"] == "vaultwarden"][0
 ok("切到 latest 后容器 image 变成 repo:latest",
    _vw30["image"] == "vaultwarden/server:latest", _vw30["image"])
 
+print("\n=== 33. 切换 tag「原地打转」：必须如实报失败，不能报「已是最新」===")
+# 真实事故（2026-10-16 线上）：用户点「切到 latest」把 vaultwarden 切回跟随 latest，
+# 结果什么都没发生、任务还只报了另一个容器的失败。
+#
+# 成因有两层：
+#   1) 容器声明跑 vaultwarden/server:1.37.3，但它在爱快上的镜像记录是**一条**
+#      tag 为 "1.37.3,latest" 的记录（两个标签、同一份内容）。旧代码拿这条记录的
+#      **标签集合**去判断「容器是不是已经在用 latest」→ 得到 True → 判定为
+#      「已是最新」直接跳过。可容器压根没在用 latest。
+#   2) 爱快对「同名同 tag 的本地记录已存在」一律回「已存在相同内容」、拒绝重新拉取，
+#      **不比对内容**，所以那个 latest 标签上的旧内容永远刷不新。
+#
+# 正确行为：如实报失败，并给出可操作的下一步（去爱快「本地镜像」删掉这条记录）。
+# 对照（必须继续走重启、不能误报失败）见上面第 15 段：目标 tag 是**另一条独立
+# 记录**时（owner 的 tag 串里没有 new_tag），重启是真能切过去的。
+for _c33 in mock_router.FAKE.containers:
+    if _c33["name"] == "vaultwarden":
+        _c33["image"] = "vaultwarden/server:1.37.3"
+for _i33 in mock_router.FAKE.images:
+    # 显式还原成「一条记录挂两个标签」，不依赖前序副作用
+    if _i33["name"] == "vaultwarden/server":
+        _i33["tag"] = "1.37.3,latest"
+mock_router.FAKE.update_calls = []
+mock_router.FAKE.install_existing_error = True
+try:
+    _j33 = server.MANAGER.create("update", ["vaultwarden"], "latest", auto=False)
+    _job33 = wait_job(_j33.id)
+finally:
+    mock_router.FAKE.install_existing_error = False
+_st33 = step_states(_job33)
+_log33 = " ".join(x.get("message") or ""
+                  for x in _jobs_mod.JobManager._extract_logs(
+                      server.MANAGER.jobs[_j33.id]))
+
+ok("多标签记录不会被当成「容器已在使用 latest」而跳过", _st33["update"] != "skipped", _st33)
+ok("改为如实报失败", _st33["update"] == "failed", _st33)
+ok("不去用旧镜像重建容器（否则只是换个标签、内容没变）",
+   len(mock_router.FAKE.update_calls) == 0, mock_router.FAKE.update_calls)
+_vw33 = [c for c in mock_router.FAKE.containers if c["name"] == "vaultwarden"][0]
+ok("容器保持原状，仍挂在 1.37.3 上",
+   _vw33["image"] == "vaultwarden/server:1.37.3", _vw33["image"])
+ok("任务整体如实判失败（不再伪装成功）", _job33["ok"] is False, _job33.get("message"))
+ok("日志不含「已是最新版本」这种假成功措辞",
+   "已是最新版本" not in _log33, _log33[-220:])
+ok("明说了原因是「已存在相同内容 / 拒绝重新拉取」",
+   ("已存在相同内容" in _log33 or "拒绝重新拉取" in _log33), _log33[-220:])
+ok("给出了可操作的下一步（去爱快「本地镜像」删记录）",
+   "本地镜像" in _log33, _log33[-220:])
+
 # ---- 收尾：把还在跑的任务等完、把两个 HTTP 服务关掉再退出 ----
 # 否则守护线程会在解释器最终化时被硬杀，容易在退出阶段炸掉（CI 上实测 exit 139，
 # 而 131 项断言其实全过了 —— 问题出在收尾，不是测试本身）。

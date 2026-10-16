@@ -434,8 +434,16 @@ class JobManager(object):
             # 指定 tag 更新时，镜像可能早就下好了、容器却还挂在旧 tag 上
             # （实测 lucky：2.27.2 早已就绪，容器仍在跑 2.20.2）——
             # 这种情况必须继续往下走重启，否则就是「镜像下好了却没更新容器」。
-            owner_now = A.image_owner(ik, c["name"])
-            using_it = bool(owner_now and A.tag_matches(owner_now.get("tag"), new_tag))
+            #
+            # ⚠️ 判断「容器在不在用目标镜像」只看容器**自己声明的 tag**。
+            # 曾经用 `tag_matches(image_owner(..)["tag"], new_tag)`，但那是镜像条目的
+            # **标签集合**，一条记录可以同时挂多个标签（实测 vaultwarden 的条目就是
+            # `"1.37.3,latest"`）。容器明明跑 1.37.3，用集合去匹配 latest 得到 True，
+            # 于是被判成「已在用 latest」→ 静默跳过更新，用户点了「切到 latest」
+            # 什么也没发生，任务结果还报成功。这是 v1.4.2 的真实事故。
+            # `cur_tag` 来自容器声明的镜像名，没写 tag 时 `split_image` 返回 latest，
+            # 与爱快前端的口径一致。
+            using_it = (cur_tag == new_tag)
 
             # 镜像与上游一致**且容器已在用它** → 才谈得上是「已是最新」，不必重启
             if already and using_it:
@@ -447,9 +455,44 @@ class JobManager(object):
                 job.log("✅ %s 已是最新版本，未做任何改动（当前：%s）"
                         % (c["name"], cur.get("status") or "运行中"))
                 continue
+
+            # 「切换 tag」但切换原地打转：容器的镜像记录上**同时挂着当前 tag 和目标 tag**
+            # （实测 vaultwarden 的条目就是 `"1.37.3,latest"` —— 容器声明跑 1.37.3，
+            # 这条记录另外还挂着 latest）。这时把容器改成 repo:latest，落到的是
+            # **同一条记录、同一份内容**，容器不会真的变新；而爱快又只按
+            # 「同名同 tag 的本地记录是否已存在」拒拉、**不比对内容**（已存在相同内容），
+            # 于是新内容永远进不来。
+            #
+            # 必须如实报「切换失败」——曾经这里报的是「✅ 已是最新版本」，
+            # 用户点了「切到 latest」什么都没发生、任务还显示成功，这是 v1.4.2 的真实事故。
+            #
+            # 注意与「镜像早已下好、只是容器没挂上去」区分开：那种情况目标 tag 是
+            # **另一条独立记录**（owner 的 tag 串里没有 new_tag），重启是真能切过去的，
+            # 必须继续走原路径，不能误报失败。
+            if already and not using_it:
+                own_tag = (A.image_owner(ik, c["name"]) or {}).get("tag") or ""
+                if A.tag_matches(own_tag, cur_tag) and A.tag_matches(own_tag, new_tag):
+                    job.step("download", "skipped", "爱快拒绝重新拉取")
+                    job.step("update", "failed", "未能切到 %s" % new_tag)
+                    job.step("verify", "skipped", "容器保持原状")
+                    self._remember_if_known(digest_key, upstream, upstream_src)
+                    job.log(
+                        "❌ %s 没能切到 %s：它在爱快上的镜像记录（%s）已经同时挂着 "
+                        "%s 和 %s 两个标签，且是**同一份内容** —— 改成 %s:%s 只是换个"
+                        "标签，容器不会真的变新。而爱快认为「%s」本地已存在、拒绝重新"
+                        "拉取（已存在相同内容），新内容也就永远进不来。\n"
+                        "   这不是 idocker 能绕过的：请到爱快后台「Docker → 本地镜像」"
+                        "里删掉 %s 这条记录（顺带把旧容器也清掉）后重试；"
+                        "或者改成更新到具体版本号 tag。"
+                        % (c["name"], new_tag, own_tag, cur_tag, new_tag, iname,
+                           new_tag, iname, iname),
+                        level="error")
+                    failures.append(c["name"])
+                    continue
+
             if already:
                 job.log("镜像 %s:%s 已在本地，但容器当前挂在 %s 上 → 跳过下载，直接重启切过去"
-                        % (iname, new_tag, (owner_now or {}).get("tag") or "未知镜像"),
+                        % (iname, new_tag, cur_tag),
                         level="warn")
 
             # 4. 等下载（镜像本来就在本地时无需等待）
