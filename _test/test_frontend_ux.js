@@ -392,6 +392,90 @@ function boot(opts) {
     CONTAINERS.splice(idx, 0, removed);      // 还原，避免影响其他用例
   }
 
+  /* ============================================================ */
+  console.log("\n=== I. 锁定在固定版本 tag：不再谎报「全部最新」，可一键切到 latest ===");
+  {
+    // lucky 挂 gdy666/lucky:2.27.2（纯版本号）→ 后端会标 pinned=ahead。
+    // 旧版这种情况下只会显示「✓ 全部 3 个容器都已是最新」，用户便以为没新版 ——
+    // 实测踩过（vaultwarden 锁 1.37.3，latest 已是 1.37.4）。
+    const pinnedCheck = {
+      checked_at: Math.floor(Date.now() / 1000) - 60,
+      at_str: "2026-10-16 16:00:00",
+      items: {
+        "metacubex/mihomo:latest": { status: "latest" },
+        "gdy666/lucky:2.27.2": { status: "latest", pinned: "ahead" },
+        "adguard/adguardhome:latest": { status: "latest" }
+      }
+    };
+    const app = boot({ check: pinnedCheck, search: "?autorefresh=5&autocheck=0" });
+    await sleep(150);
+
+    const stat = app.el("updStat").textContent;
+    ok("不再谎报「全部最新」，单独交代锁定容器",
+       /锁定在固定版本/.test(stat) && !/都已是最新/.test(stat), stat);
+    ok("概览条用 pinned 专属样式（与 ok / newer 区分）",
+       app.el("updStat").className === "upd-stat pinned", app.el("updStat").className);
+    ok("给出「切到 latest」按钮且写明数量",
+       !app.el("btnPinToLatest").classList.contains("hidden") &&
+       /1 个/.test(app.el("btnPinToLatest").textContent),
+       app.el("btnPinToLatest").textContent);
+    ok("此时没有「可更新」，所以不显示一键更新",
+       app.el("btnUpdateAll").classList.contains("hidden"));
+
+    const html = app.lastHtml("ctBody");
+    ok("锁定行标出「⚑ 锁定」",
+       /badge pin/.test(html) && html.indexOf("⚑ 锁定") >= 0);
+    ok("锁定行有专属行标记 row-pinned", /class="row-pinned"/.test(html));
+    ok("锁定行给了行内「切到 latest」按钮",
+       /ct-pin" data-name="lucky"/.test(html), html.slice(0, 800));
+    ok("只有锁定那一行有标记（跟随 latest 的两行没有）",
+       (html.match(/badge pin/g) || []).length === 1,
+       (html.match(/badge pin/g) || []).length);
+
+    // 点概览条「切到 latest」→ 先确认；确认框必须讲清语义是「不再锁定」而非「固定到 latest」
+    const before = app.calls("/api/update").length;
+    app.el("btnPinToLatest").click();
+    await sleep(60);
+    ok("点「切到 latest」先弹确认框，没有直接开跑",
+       !app.el("cfmModal").classList.contains("hidden") &&
+       app.calls("/api/update").length === before);
+    const body = app.el("cfmBody").innerHTML;
+    ok("确认框说明是「切换为跟随 latest」而不是「固定为 latest」",
+       /切换为跟随 latest/.test(body) && !/版本固定为/.test(body), body);
+    ok("确认框点出它当前锁在哪个版本", /锁定在 2\.27\.2/.test(body), body);
+    ok("确认按钮文案是「切到 latest」",
+       app.el("cfmOk").textContent === "切到 latest", app.el("cfmOk").textContent);
+
+    app.el("cfmOk").click();
+    await sleep(120);
+    const calls = app.calls("/api/update");
+    ok("确认后才真的发请求", calls.length === before + 1);
+    ok("请求带上 tag=latest", calls.length && calls[calls.length - 1].body.tag === "latest",
+       calls.length && calls[calls.length - 1].body);
+    ok("请求只针对锁定的那个容器",
+       calls.length && calls[calls.length - 1].body.containers.join(",") === "lucky",
+       calls.length && calls[calls.length - 1].body);
+
+    // 对照：锁定解除后，回到「全部最新」的正常呈现，且不再显示切换入口
+    const cleared = {
+      checked_at: Math.floor(Date.now() / 1000) - 30,
+      at_str: "2026-10-16 16:10:00",
+      items: {
+        "metacubex/mihomo:latest": { status: "latest" },
+        "gdy666/lucky:2.27.2": { status: "latest" },
+        "adguard/adguardhome:latest": { status: "latest" }
+      }
+    };
+    const app2 = boot({ check: cleared, search: "?autorefresh=5&autocheck=0" });
+    await sleep(150);
+    ok("锁定解除后恢复「都已是最新」的肯定结论",
+       /都已是最新/.test(app2.el("updStat").textContent) &&
+       app2.el("updStat").className === "upd-stat ok",
+       app2.el("updStat").textContent);
+    ok("没有锁定容器时不显示「切到 latest」按钮",
+       app2.el("btnPinToLatest").classList.contains("hidden"));
+  }
+
   console.log("\n----------------------------------------");
   console.log("通过 " + PASS + " 项，失败 " + FAIL + " 项");
   process.exit(FAIL ? 1 : 0);

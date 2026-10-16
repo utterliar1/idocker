@@ -247,6 +247,25 @@ def repo_of(image):
     return image.rsplit(":", 1)[0] if ":" in tail else image
 
 
+# 「纯版本号」tag：1.37.3 / v2.27 / 3 之类。
+# 刻意**不匹配**带后缀的变体（1.37.3-alpine）和语义 tag（latest / ssh / slim）——
+# 它们和 latest 是并列的不同东西，不是版本新旧关系，切过去等于换了产品。
+_VERSION_TAG_RE = re.compile(r"^v?\d+(?:\.\d+)*$")
+
+
+def is_version_tag(tag):
+    """tag 是不是「锁定的具体版本号」形式。
+
+    为什么要单独认这个：容器一旦被用 ``--tag 1.37.3`` 更新过，它的 image 就变成
+    ``repo:1.37.3``、**永久锁在该 tag 上，不再跟随 latest**。而版本号 tag 的上游内容
+    是固定的，所以检测永远报「已是最新」—— 实测 vaultwarden 锁在 1.37.3、latest
+    其实早已是 1.37.4，用户看到的就是「明明有新版却检测不出来」。
+    识别出来才能把这件事显式告诉用户（见 ``jobs._run_check`` 的 ``pinned`` 字段）。
+    """
+    return bool(_VERSION_TAG_RE.match(str(tag or "").strip()))
+
+
+
 def container_payload(c, insp, tag=None, start=None):
     """用容器现有配置 + 新 tag 拼出 add/update 的 param
 

@@ -26,7 +26,7 @@ The frontend timing suite must run with ?autocheck=0 in its test setup. Tests th
 - Do not remove the _persist_lock around jobs persistence. Keep dry_run scoped to each Job, not mutable global configuration.
 - Preserve the data volume name ikuai-updater-data.
 - Login must keep the real form, autocomplete="username", and autocomplete="current-password"; do not send WWW-Authenticate to unauthenticated browser requests. Preserve Basic authentication for scripts and CI. Missing AUTH_PASS with AUTH_USER configured must fail closed.
-- Frontend colors use CSS variables. Table cells need data-label attributes for the narrow-screen layout. The overview may say all containers are current only when every check succeeded.
+- Frontend colors use CSS variables. Table cells need data-label attributes for the narrow-screen layout. The overview may say all containers are current only when every check succeeded AND no container is pinned to a fixed version tag whose repository latest has moved on. Detect pins with A.is_version_tag (pure version numbers such as 1.37.3 / v2.7); variant and semantic tags (1.37.3-alpine, latest, ssh, slim) are not pins and must never be flagged — they are parallel variants, not stale versions. Switching a pinned container back to latest goes through the confirmation dialog with the "switch to follow latest" wording.
 - Individual container failures must not abort a batch update. Keep update jobs mutually exclusive and allow a running check job to be reused.
 
 ## Release and Deployment

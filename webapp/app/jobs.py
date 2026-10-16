@@ -587,6 +587,7 @@ class JobManager(object):
         registries = A.resolve_registries(ik, cfg, job.log)
         job.log("查询上游用的加速源（来自爱快 Docker 服务设置）：%s" % "、".join(registries))
         results, seen = [], set()
+        latest_cache = {}          # repo → latest digest，避免同一仓库重复查
         for c in cs:
             image = c.get("image") or ""
             repo, tag = A.repo_of(image), A.split_image(image)[2]
@@ -596,12 +597,28 @@ class JobManager(object):
             seen.add(key)
             local_ts, _src = local.pulled_at(local.find(repo, tag))
             item = {"container": c["name"], "image": key, "local": local_ts or "—",
-                    "status": "unknown", "digest": "", "registry": ""}
+                    "status": "unknown", "digest": "", "registry": "", "pinned": ""}
             try:
                 digest, reg = A.remote_digest(registries, repo, tag, ctx, cfg["timeout"])
                 item["digest"], item["registry"] = digest[:19], reg
                 old = self._seen_digest(key)
                 item["status"] = "unknown" if old is None else ("newer" if old != digest else "latest")
+                # 容器锁在具体版本号 tag 上时（如 vaultwarden/server:1.37.3），该 tag 的
+                # 上游内容是固定的，上面必然得出「latest」。但那不等于没有新版 ——
+                # 该仓库的 latest 可能早就走远了。额外查一次 latest 作对比，把
+                # 「锁着、但上游已经前进」这件事显式暴露出来，否则用户看到的就是
+                # 「Docker Hub 明明有新版，idocker 却说已是最新」（实测踩过）。
+                if A.is_version_tag(tag):
+                    if repo not in latest_cache:
+                        try:
+                            latest_cache[repo] = A.remote_digest(
+                                registries, repo, "latest", ctx, cfg["timeout"])[0]
+                        except Exception as e:              # noqa: BLE001
+                            latest_cache[repo] = ""
+                            job.log("· 查询 %s:latest 失败：%s" % (repo, e), level="debug")
+                    lv = latest_cache[repo]
+                    if lv and lv != digest:
+                        item["pinned"] = "ahead"
                 # 逐个镜像都记一行，并带上命中的加速源 —— 事后回看历史时，
                 # 「查到的是哪个源的什么结果」比只看到一句「检测完成」有用得多。
                 st = item["status"]
@@ -611,6 +628,10 @@ class JobManager(object):
                     job.log("✓ %s 已是最新（命中 %s）" % (key, reg))
                 else:
                     job.log("· %s 首次检测，已记下基准（命中 %s）" % (key, reg))
+                if item["pinned"] == "ahead":
+                    job.log("⚑ %s 锁定在 %s，但 %s:latest 已更新"
+                            "（可用行内「指定版本」填 latest 切回跟随）"
+                            % (key, tag, repo), level="warn")
                 self._remember_digest(key, digest, reg)
                 results.append(item)
             except Exception as e:
@@ -622,8 +643,12 @@ class JobManager(object):
         job.emit("check_result", results=results)
         self._save_last_check(results)
         newer = [r["container"] for r in results if r["status"] == "newer"]
+        pinned = [r["container"] for r in results if r.get("pinned") == "ahead"]
         job.log("检测完成，%d 个镜像有新版%s"
                 % (len(newer), ("：" + "、".join(newer)) if newer else ""))
+        if pinned:
+            job.log("另有 %d 个容器锁定在固定版本 tag，latest 已更新：%s"
+                    % (len(pinned), "、".join(pinned)), level="warn")
         return True, "已检查 %d 个镜像" % len(results)
 
     # -- 上次检测结果（页面刷新后仍能显示上游状态）--------------------
@@ -634,7 +659,8 @@ class JobManager(object):
         items = {}
         for r in results:
             items[r["image"]] = {"status": r["status"], "digest": r.get("digest", ""),
-                                 "registry": r.get("registry", ""), "local": r.get("local", "")}
+                                 "registry": r.get("registry", ""), "local": r.get("local", ""),
+                                 "pinned": r.get("pinned", "")}
         payload = {"checked_at": time.time(),
                    "at_str": time.strftime("%Y-%m-%d %H:%M:%S"),
                    "items": items}

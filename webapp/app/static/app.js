@@ -9,6 +9,7 @@
   var state = {
     containers: [],
     checkMap: {},        // "repo:tag" → 上游状态
+    pinMap: {},          // "repo:tag" → "ahead" 表示锁定在固定版本、但 latest 已更新
     checkAt: "",
     selected: {},
     job: null,
@@ -218,8 +219,12 @@
       // 恢复上次检测结果，刷新页面后上游状态不丢
       var ck = d.check || {};
       state.checkMap = {};
+      state.pinMap = {};
       var items = ck.items || {};
-      Object.keys(items).forEach(function (k) { state.checkMap[k] = items[k].status; });
+      Object.keys(items).forEach(function (k) {
+        state.checkMap[k] = items[k].status;
+        if (items[k].pinned) state.pinMap[k] = items[k].pinned;
+      });
       state.checkTs = ck.checked_at || 0;
       state.checkAt = ck.at_str || "";
       $("checkTime").textContent = state.checkAt ? ("上次检测 " + state.checkAt.slice(5)) : "";
@@ -243,6 +248,15 @@
   /* ---------------- 上游状态 ---------------- */
   function checkKey(c) { return (c.repo || "") + ":" + (c.tag || ""); }
   function checkStatusOf(c) { return state.checkMap[checkKey(c)] || "unknown"; }
+  // 「锁定在固定版本号 tag、但该仓库 latest 已经更新」。
+  // 这种容器的 status 其实是 latest（因为它挂的那个 tag 内容确实没变），
+  // 单看 status 会误判成「一切正常」，必须单独拿出来说 —— 否则用户看到的就是
+  // 「Docker Hub 明明有新版，页面却说全部最新」（v1.4.2 修的就是这个）。
+  function pinStatusOf(c) { return state.pinMap[checkKey(c)] || ""; }
+  function pinnedContainers() {
+    // 用排好序的列表，确认框里的顺序跟表格一致
+    return sortedContainers().filter(function (c) { return pinStatusOf(c) === "ahead"; });
+  }
   function updatableContainers() {
     // 用排好序的列表：一键更新的确认框里，顺序跟表格里看到的一致
     return sortedContainers().filter(function (c) { return checkStatusOf(c) === "newer"; });
@@ -259,40 +273,63 @@
     });
   }
 
-  /* 概览条：一眼看到「有没有要更新的、有几个」，并给出一键更新入口。 */
+  /* 概览条：一眼看到「有没有要更新的、有几个」，并给出一键更新入口。
+     另外单独交代「锁定在固定版本 tag」的容器 —— 它们不算「可更新」（挂的 tag
+     内容确实没变），但上游 latest 可能早已前进，不说清楚用户会以为漏检了。 */
   function renderUpdBar() {
     var total = state.containers.length;
-    var newer = 0, latest = 0, failed = 0;
+    var newer = 0, latest = 0, failed = 0, pinned = 0;
     state.containers.forEach(function (c) {
       var k = checkStatusOf(c);
       if (k === "newer") newer++;
       else if (k === "latest") latest++;
       else if (k === "failed") failed++;
+      if (pinStatusOf(c) === "ahead") pinned++;
     });
-    var stat = $("updStat"), all = $("btnUpdateAll");
+    var stat = $("updStat"), all = $("btnUpdateAll"), pin = $("btnPinToLatest");
     if (!stat) return;
+    function showPin() {
+      if (!pin) return;
+      pin.textContent = "切到 latest（" + pinned + " 个）";
+      pin.classList.remove("hidden");
+    }
+    function hidePin() { if (pin) pin.classList.add("hidden"); }
 
     if (state.detecting) {
       stat.className = "upd-stat busy";
       stat.textContent = "正在检测上游版本…";
       all.classList.add("hidden");
+      hidePin();
       return;
     }
     if (!total) {
       stat.className = "upd-stat";
       stat.textContent = "没有容器";
       all.classList.add("hidden");
+      hidePin();
       return;
     }
     if (newer) {
       stat.className = "upd-stat newer";
       stat.textContent = "⬆ 有 " + newer + " 个容器可以更新" +
-        (failed ? "（另 " + failed + " 个查询失败）" : "");
+        (failed ? "（另 " + failed + " 个查询失败）" : "") +
+        (pinned ? "；另有 " + pinned + " 个锁定在固定版本" : "");
       all.textContent = "更新这 " + newer + " 个";
       all.classList.remove("hidden");
+      if (pinned) showPin(); else hidePin();
       return;
     }
     all.classList.add("hidden");
+    // 没有「可更新」但存在「锁着、且 latest 已前进」的容器 —— 这是最容易被
+    // 误解成「全部最新」的情形，必须单独说，并直接给一键切换入口。
+    if (pinned) {
+      stat.className = "upd-stat pinned";
+      stat.textContent = "⚑ 另有 " + pinned + " 个容器锁定在固定版本 tag，" +
+        "其 latest 已发布更新（锁定状态下不会自动算作「可更新」）";
+      showPin();
+      return;
+    }
+    hidePin();
     if (state.checkTs && latest === total) {
       stat.className = "upd-stat ok";
       stat.textContent = "✓ 全部 " + total + " 个容器都已是最新";
@@ -349,10 +386,12 @@
         var badge = { newer: ["newer", "⬆ 有新版本"], latest: ["latest", "已是最新"],
                       failed: ["failed", "查询失败"], running: ["running", "更新中"] }[st]
                     || ["", "未检测"];
+        var pin = pinStatusOf(c) === "ahead";
         var running = String(c.state) === "running";
         var led = running ? "up" : "down";
         return '' +
-          '<tr class="' + (st === "newer" ? "need-upd" : "") + '" data-name="' + esc(c.name) + '">' +
+          '<tr class="' + (st === "newer" ? "need-upd" : (pin ? "row-pinned" : "")) +
+            '" data-name="' + esc(c.name) + '">' +
             '<td class="cb" data-label=""><input type="checkbox" class="ct-pick" data-name="' + esc(c.name) + '"' +
               (state.selected[c.name] ? " checked" : "") + '></td>' +
             '<td data-label="容器"><div class="ct-name">' + esc(c.name) + '</div>' +
@@ -365,10 +404,15 @@
             '<td class="mono" data-label="镜像拉取于">' + localPulledCell(c) + '</td>' +
             '<td data-label="上游"><span class="badge ' + badge[0] + '" title="' +
               esc(state.checkAt ? ("检测于 " + state.checkAt) : "尚未检测") + '">' +
-              badge[1] + '</span></td>' +
+              badge[1] + '</span>' +
+              (pin ? ' <span class="badge pin" title="该容器锁定在固定版本 tag（' + esc(c.tag) +
+                     '），不跟随 latest；上游 latest 已有更新。点右侧「切到 latest」可改为跟随 latest">⚑ 锁定</span>'
+                   : '') + '</td>' +
             '<td class="r ct-acts">' +
               '<button class="btn tiny ghost ct-tag" data-name="' + esc(c.name) + '" ' +
                 'data-repo="' + esc(c.repo) + '" data-tag="' + esc(c.tag) + '">指定版本</button> ' +
+              (pin ? '<button class="btn tiny primary ct-pin" data-name="' + esc(c.name) +
+                     '">切到 latest</button> ' : '') +
               '<button class="btn tiny' + (st === "newer" ? " primary" : "") +
                 ' ct-upd" data-name="' + esc(c.name) + '">更新</button>' +
             '</td>' +
@@ -413,6 +457,10 @@
     });
     Array.prototype.forEach.call(document.querySelectorAll(".ct-tag"), function (b) {
       b.addEventListener("click", function () { openTagModal(b.dataset.name, b.dataset.repo, b.dataset.tag); });
+    });
+    // 锁定在固定版本 tag 的容器：一键切回跟随 latest
+    Array.prototype.forEach.call(document.querySelectorAll(".ct-pin"), function (b) {
+      b.addEventListener("click", function () { startUpdate([b.dataset.name], "latest"); });
     });
   }
 
@@ -618,7 +666,11 @@
 
     es.addEventListener("check_result", function (e) {
       var d = JSON.parse(e.data);
-      (d.results || []).forEach(function (r) { state.checkMap[r.image] = r.status; });
+      (d.results || []).forEach(function (r) {
+        state.checkMap[r.image] = r.status;
+        if (r.pinned) state.pinMap[r.image] = r.pinned;
+        else delete state.pinMap[r.image];   // 切到 latest 后要能摘掉锁定标记
+      });
       renderContainers();
     });
 
@@ -673,10 +725,12 @@
 
   /* ---------------- 触发任务 ---------------- */
   // 更新会重启容器（服务短暂中断），批量之前先让人确认一遍，并列出到底动谁
-  function startUpdate(names) {
+  // tag 传 "latest" 表示「切回跟随 latest」（用于解除固定版本锁定）
+  function startUpdate(names, tag) {
     if (!names || !names.length) return;
     if (state.busy || state.source) { toast("已有任务在执行，等它跑完再说", "warn"); return; }
-    confirmUpdate(names, "").then(function (yes) { if (yes) runUpdate(names, ""); });
+    tag = tag || "";
+    confirmUpdate(names, tag).then(function (yes) { if (yes) runUpdate(names, tag); });
   }
 
   function confirmUpdate(names, tag) {
@@ -686,22 +740,30 @@
     var rows = names.map(function (n) {
       var c = map[n];
       var st = c ? checkStatusOf(c) : "unknown";
-      var tail = st === "newer" ? '<span class="badge newer">有新版本</span>'
+      var isPin = c ? pinStatusOf(c) === "ahead" : false;
+      var tail = isPin ? '<span class="badge pin">锁定在 ' + esc(c.tag) + '</span>'
+               : st === "newer" ? '<span class="badge newer">有新版本</span>'
                : st === "latest" ? '<span class="badge latest">已是最新</span>' : "";
       var img = c ? ((c.repo || "") + ":" + (c.tag || "")) : "";
       return '<li><span class="cfm-nm">' + esc(n) + '</span>' +
              '<span class="mono cfm-img">' + esc(img) + '</span>' + tail + '</li>';
     }).join("");
+    // 切到 latest 和「固定到某个版本」是相反的语义，文案必须分开写，
+    // 否则用户会以为 latest 是又一个「被固定住的版本号」。
+    var tagNote = !tag ? ""
+      : tag === "latest"
+        ? '，并<b>切换为跟随 latest</b>（此后不再锁定在固定版本，上游一更新就能检测到）'
+        : '，版本固定为 <b>' + esc(tag) + '</b>（此后锁定在该版本，不跟随 latest）';
     return confirmBox({
-      title: dry ? "确认演练更新" : "确认更新容器",
+      title: dry ? "确认演练更新" : (tag === "latest" ? "确认切换为跟随 latest" : "确认更新容器"),
       html: '<p class="cfm-lead">将' + (dry ? "演练" : "") + '更新以下 <b>' + names.length +
-            '</b> 个容器' + (tag ? '，版本固定为 <b>' + esc(tag) + '</b>' : '') + '：</p>' +
+            '</b> 个容器' + tagNote + '：</p>' +
             '<ul class="cfm-list">' + rows + '</ul>' +
             '<p class="cfm-note">' + (dry
               ? "当前是<b>干跑模式</b>：只走一遍流程并打印将要发出的请求，<b>不会真的重启任何容器</b>。"
               : "过程中这些容器会各<b>重启一次</b>，服务短暂中断（几秒到几十秒，视镜像大小而定）。") +
             '</p>',
-      okText: dry ? "开始演练" : "开始更新",
+      okText: dry ? "开始演练" : (tag === "latest" ? "切到 latest" : "开始更新"),
       danger: !dry
     });
   }
@@ -1126,6 +1188,10 @@
   $("btnCheckInline").addEventListener("click", function () { startCheck(false); });
   $("btnUpdateAll").addEventListener("click", function () {
     startUpdate(updatableContainers().map(function (c) { return c.name; }));
+  });
+  // 锁定在固定版本 tag 的容器批量切回跟随 latest
+  $("btnPinToLatest").addEventListener("click", function () {
+    startUpdate(pinnedContainers().map(function (c) { return c.name; }), "latest");
   });
 
   // 通用确认弹窗

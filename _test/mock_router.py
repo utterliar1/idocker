@@ -71,6 +71,14 @@ class Fake(object):
         # 模拟真实爱快：镜像已存在时返回「已存在相同内容，请勿重复下载」错误
         # （实测爱快两种行为都有：报错、或安静地重新登记）
         self.install_existing_error = False
+        # 上游 digest：默认所有 repo/tag 都是同一个值。测试可往 self.digests 里塞
+        # "repo:tag" → digest 来模拟「某仓库的 latest 已经前进，但某个版本 tag 没动」
+        # —— 这正是「容器锁在固定版本，检测永远说已是最新」那个场景。
+        self.digests = {}
+        self.digest_default = DIGEST
+
+    def digest_for(self, repo, tag):
+        return self.digests.get("%s:%s" % (repo, tag), self.digest_default)
 
     # -- 动作 ------------------------------------------------------
     def _attach_owner(self, container_name, full_image):
@@ -184,11 +192,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         # 极简 registry：/v2/<repo...>/manifests/<tag>
-        if "/manifests/" in self.path:
+        m = re.match(r"^/v2/(.+)/manifests/([^/?]+)", self.path)
+        if m:
+            repo, tag = m.group(1), m.group(2)
+            body = b""
             self.send_response(200)
-            self.send_header("Docker-Content-Digest", DIGEST)
-            self.send_header("Content-Length", "0")
+            self.send_header("Docker-Content-Digest", FAKE.digest_for(repo, tag))
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
+            if body:
+                self.wfile.write(body)
             return
         self._json({"code": 0})
 

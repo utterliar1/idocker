@@ -788,6 +788,64 @@ except OSError:
     _raised_store = True
 ok("设置写盘失败不会伪装成成功", _raised_store)
 
+print("\n=== 32. 锁定在固定版本 tag：必须提示「latest 已更新」===")
+# 背景：容器一旦被用具体版本 tag 更新过（vaultwarden/server:1.37.3），它就锁在
+# 那个 tag 上、不再跟随 latest；而版本号 tag 的上游内容是固定的 —— 于是检测
+# 永远报「已是最新」，用户却眼睁睁看着 Docker Hub 上 latest 变成 1.37.4。
+# 所以检测要额外看一眼该仓库的 latest，把「锁着但上游已前进」显式标出来。
+ok("纯版本号 tag 判为「锁定」",
+   A.is_version_tag("1.37.3") and A.is_version_tag("v2.7") and A.is_version_tag("3"))
+ok("变体/语义 tag 不误判（ssh 与 latest 是并列变体，不是版本落后）",
+   not A.is_version_tag("ssh") and not A.is_version_tag("latest")
+   and not A.is_version_tag("1.37.3-alpine") and not A.is_version_tag("slim"))
+
+_AHEAD = "sha256:" + "d" * 64
+# 前面的测试已经把 vaultwarden 切到过别的 tag，这里显式还原成「锁定在 1.37.3」，
+# 让本段自包含、不依赖前序副作用。
+for _c29 in mock_router.FAKE.containers:
+    if _c29["name"] == "vaultwarden":
+        _c29["image"] = "vaultwarden/server:1.37.3"
+# 造一个「锁在变体 tag」的容器：即便上游 latest 内容不同，也不该被标记
+mock_router.FAKE.containers.append({
+    "id": "eeee4444ffff", "name": "webssh", "image": "lihaixin/webssh2:ssh",
+    "state": "running", "status": "Up 1 day", "interface": "doc_docker",
+    "ipaddr": "192.168.3.9", "ip6addr": "", "auto_start": 1,
+    "mounts": "", "ports": [], "env": "", "cmd": "", "comment": ""})
+mock_router.FAKE.digests = {"vaultwarden/server:latest": _AHEAD,
+                            "lihaixin/webssh2:latest": _AHEAD}
+try:
+    _j29 = server.MANAGER.create("check", [], None)
+    wait_job(_j29.id)
+    _res29 = [e for e in _j29.events if e.get("type") == "check_result"]
+    _rs29 = {r["image"]: r for r in (_res29[-1]["results"] if _res29 else [])}
+finally:
+    mock_router.FAKE.digests = {}
+    mock_router.FAKE.containers = [c for c in mock_router.FAKE.containers
+                                   if c["name"] != "webssh"]
+
+_vw29 = _rs29.get("vaultwarden/server:1.37.3") or {}
+ok("锁定在版本号 tag 的容器被标为 pinned=ahead", _vw29.get("pinned") == "ahead", _vw29)
+ok("它的 status 仍不是 newer（挂的 tag 内容确实没变）",
+   _vw29.get("status") != "newer", _vw29)
+_cl29 = _rs29.get("dreamacro/clash:latest") or {}
+ok("跟随 latest 的容器不会被标 pinned", not _cl29.get("pinned"), _cl29)
+_ws29 = _rs29.get("lihaixin/webssh2:ssh") or {}
+ok("变体 tag（ssh）即使 latest 不同也不误报", not _ws29.get("pinned"), _ws29)
+
+with open(os.path.join(DATA, "last_check.json"), encoding="utf-8") as _f29:
+    _lc29 = json.load(_f29)
+ok("pinned 已落盘（刷新页面后仍能显示）",
+   ((_lc29.get("items") or {}).get("vaultwarden/server:1.37.3") or {}).get("pinned") == "ahead",
+   (_lc29.get("items") or {}).get("vaultwarden/server:1.37.3"))
+
+# 端到端：从「锁定在 1.37.3」切回跟随 latest
+mock_router.FAKE.update_calls = []
+_j30 = server.MANAGER.create("update", ["vaultwarden"], "latest")
+wait_job(_j30.id)
+_vw30 = [c for c in mock_router.FAKE.containers if c["name"] == "vaultwarden"][0]
+ok("切到 latest 后容器 image 变成 repo:latest",
+   _vw30["image"] == "vaultwarden/server:latest", _vw30["image"])
+
 # ---- 收尾：把还在跑的任务等完、把两个 HTTP 服务关掉再退出 ----
 # 否则守护线程会在解释器最终化时被硬杀，容易在退出阶段炸掉（CI 上实测 exit 139，
 # 而 131 项断言其实全过了 —— 问题出在收尾，不是测试本身）。
