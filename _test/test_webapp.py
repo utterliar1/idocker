@@ -1037,6 +1037,97 @@ mock_router.FAKE.configs.pop("dreamacro/clash:2.8.0", None)
 mock_router.FAKE.images = [i for i in mock_router.FAKE.images
                            if i["name"] != "dreamacro/clash" or i.get("tag") == "latest"]
 
+print("\n=== 35b. 第 6 步必须用「最新的容器 id」：update 会重建容器 ===")
+# 真机 10:57 那次纯假成功（用户当场指出）：日志写着「clash 现在跑 mihomo:latest」，
+# 实际爱快里容器声明的还是 v1.19.33。两个错叠在一起：
+#   ① 第 3 步切到版本号 tag 时爱快**重建了容器、id 变了**，第 6 步「切回 latest」
+#      还拿流程开始时的旧 id 下发 → 爱快回 code:0 却什么都没做（静默空操作）；
+#   ② `_wait_running` 拿**镜像记录的标签集合**当证据 —— 那条记录是
+#      `tag="latest,v1.19.33"`，里面当然有 latest，于是白跑也判成功。
+# 这两个开关就是为它加的：id 会变 + 旧 id 静默忽略。
+mock_router.FAKE.id_changes_on_update = True
+mock_router.FAKE.strict_update_id = True
+mock_router.FAKE.update_ignored = []
+_clash35c = [c for c in mock_router.FAKE.containers if c["name"] == "clash"][0]
+_clash35c["image"] = "dreamacro/clash:latest"
+mock_router.FAKE.images = [i for i in mock_router.FAKE.images
+                           if i["name"] != "dreamacro/clash"]
+mock_router.FAKE.images.append({
+    "name": "dreamacro/clash", "tag": "latest", "id": mock_router.OLD_ID,
+    "install": int(time.time()) - 86400, "created": int(time.time()) - 86400,
+    "size": 1, "namespace": "dreamacro",
+    "containers": [{"name": "clash", "state": "running"}]})
+mock_router.FAKE.configs["dreamacro/clash:latest"] = mock_router.NEW_ID
+mock_router.FAKE.configs["dreamacro/clash:2.9.0"] = mock_router.NEW_ID
+mock_router.FAKE.tags["dreamacro/clash"] = ["latest", "2.9.0"]
+mock_router.FAKE.update_calls = []
+mock_router.FAKE.install_calls = []
+mock_router.FAKE.del_calls = []
+mock_router.FAKE.install_existing_error = True
+try:
+    _j35c = server.MANAGER.create("update", ["clash"], None, auto=False)
+    _job35c = wait_job(_j35c.id)
+finally:
+    mock_router.FAKE.install_existing_error = False
+    mock_router.FAKE.id_changes_on_update = False
+    mock_router.FAKE.strict_update_id = False
+_log35c = " ".join(x.get("message") or ""
+                   for x in _jobs_mod.JobManager._extract_logs(
+                       server.MANAGER.jobs[_j35c.id]))
+_clash35d = [c for c in mock_router.FAKE.containers if c["name"] == "clash"][0]
+
+ok("容器最终真的声明 latest（不是停在版本号 tag 上）",
+   _clash35d["image"] == "dreamacro/clash:latest", _clash35d["image"])
+ok("没有一次 update 是被旧 id 静默吃掉的", not mock_router.FAKE.update_ignored,
+   [x.get("image") for x in mock_router.FAKE.update_ignored])
+ok("任务判成功且如实反映", _job35c["ok"] is True, _job35c.get("message"))
+ok("不再承诺「临时记录可当回滚点」（爱快会并成一条记录）",
+   "可当回滚点" not in _log35c, _log35c[-300:])
+ok("说清了爱快把同内容多标签并成一条记录", "并成" in _log35c, _log35c[-300:])
+ok("给出了真正的回滚方式（把镜像改成版本号 tag）",
+   "要回滚" in _log35c, _log35c[-300:])
+mock_router.FAKE.tags.pop("dreamacro/clash", None)
+mock_router.FAKE.configs.pop("dreamacro/clash:2.9.0", None)
+mock_router.FAKE.images = [i for i in mock_router.FAKE.images
+                           if i["name"] != "dreamacro/clash" or i.get("tag") == "latest"]
+
+print("\n=== 35c. 判定「切没切过去」只能看容器自己声明的 tag ===")
+# 线上出现的那条记录长这样：tag="latest,v1.19.33"（同内容多标签被并成一条），
+# 而容器声明的是 v1.19.33。旧代码拿**记录标签集合**去匹配，看到里面有 latest
+# 就判成功 —— 白跑一趟还报 ✅。容器用哪个 tag，只认它自己的 image。
+mock_router.FAKE.images = [i for i in mock_router.FAKE.images
+                           if i["name"] != "multi/app"]
+# 一个容器只能挂在一条记录上：先把 clash 从别的记录上摘干净，
+# 否则 image_owner 会返回列表里靠前的那条，测不出想测的东西。
+for _img35e in mock_router.FAKE.images:
+    _img35e["containers"] = [x for x in (_img35e.get("containers") or [])
+                             if x.get("name") != "clash"]
+mock_router.FAKE.images.append({
+    "name": "multi/app", "tag": "latest,2.9.0", "id": mock_router.NEW_ID,
+    "install": 1, "created": 1, "size": 1, "namespace": "multi",
+    "containers": [{"name": "clash", "state": "running"}]})
+_clash35e = [c for c in mock_router.FAKE.containers if c["name"] == "clash"][0]
+_clash35e["image"] = "multi/app:2.9.0"
+_okw, _why = server.MANAGER._wait_running(_ik, "clash", "latest", tries=1, gap=0)
+ok("容器声明 2.9.0 时不判成功（记录里有 latest 也没用）", _okw is False, _why)
+ok("说明里点出容器实际声明的 tag", "2.9.0" in _why, _why)
+
+_clash35e["image"] = "multi/app:latest"
+_okw2, _why2 = server.MANAGER._wait_running(_ik, "clash", "latest", tries=1, gap=0)
+ok("容器真的声明 latest 时才判成功", _okw2 is True, _why2)
+
+# 老数据：容器 image 完全没有 tag（早期 lucky 那种），才退回看记录 ——
+# 但必须要求记录的 repo 和容器 image 的 repo 一致，不给错配留缝。
+_clash35e["image"] = "multi/app"
+_okw3, _why3 = server.MANAGER._wait_running(_ik, "clash", "latest", tries=1, gap=0)
+ok("image 无 tag 时退回看记录（repo 一致才认）", _okw3 is True, _why3)
+_clash35e["image"] = "other/app"
+_okw4, _why4 = server.MANAGER._wait_running(_ik, "clash", "latest", tries=1, gap=0)
+ok("repo 都对不上时绝不认", _okw4 is False, _why4)
+_clash35e["image"] = "dreamacro/clash:latest"
+mock_router.FAKE.images = [i for i in mock_router.FAKE.images
+                           if i["name"] != "multi/app"]
+
 print("\n=== 36. 「指定版本」：爱快没给列表时退回加速源 + 支持手填 ===")
 # 实测 metacubex/mihomo 的 tag_list 恒为空 → 弹窗只有一句「没查到版本列表」，
 # 用户既选不了也填不了，只能干瞪眼。

@@ -714,13 +714,31 @@ class JobManager(object):
         return True, "完成 %d 个容器的更新" % len(plans)
 
     # -- 搬运：把 latest 落后的内容弄进本地 ---------------------------------
-    def _wait_running(self, ik, name, want_tag, tries=8, gap=2):
-        """等容器起来并确认它真的挂在 ``want_tag`` 上，返回 ``(ok, 说明)``。
+    @staticmethod
+    def _live(ik, name, fallback=None):
+        """重新读一遍容器 —— **update 会重建容器、id 会变**。
 
-        只看 state=running 是不够的：爱快的 update 是异步的，容器自身的 image
-        字段常常不带 tag，重建了却仍跑旧镜像的情况实测出现过（lucky）。
+        拿流程开始时那份快照的 id 再 update，爱快会回 ``code:0 Success`` 却
+        什么都不做（静默空操作，和 ``docker_image.del`` 一个脾气）。
+        2026-10-22 实测：搬运第 3 步切到版本号 tag 后 id 就变了，第 6 步
+        「切回 latest」沿用旧 id → 白跑一趟，容器仍声明旧 tag。
         """
-        after, owner = None, None
+        return ({x["name"]: x for x in A.get_containers(ik)}.get(name)
+                or fallback or {})
+
+    def _wait_running(self, ik, name, want_tag, tries=8, gap=2):
+        """等容器起来并确认它**自己声明的 image** 已经切到 ``want_tag``。
+
+        三层判断，缺一不可：
+
+        1. 只看 `state=running` 不够 —— 爱快 update 是异步的；
+        2. **绝不能拿镜像记录的标签集合代替容器声明**。一条记录可以同时挂
+           `tag="latest,v1.19.33"`，容器明明还声明着 `v1.19.33`，记录里却有
+           latest —— 旧写法据此判成功，「切回 latest」白跑还报 ✅（实测踩到）；
+        3. 容器 image 真的不带 tag 时（早期 lucky 那种老数据）才退回看记录，
+           并且**要求记录的 repo 与容器 image 的 repo 一致**，不给错配留缝。
+        """
+        after = None
         for _ in range(tries):
             time.sleep(gap)
             after = {x["name"]: x for x in A.get_containers(ik)}.get(name)
@@ -731,15 +749,20 @@ class JobManager(object):
         if after.get("state") != "running":
             return False, "容器状态异常（%s）" % (after.get("status") or "未知")
         for _ in range(4):
-            owner = A.image_owner(ik, name)
-            if owner and A.tag_matches(owner.get("tag"), want_tag):
+            after = self._live(ik, name, after)
+            img = str(after.get("image") or "")
+            if ":" in img.rsplit("/", 1)[-1] and A.tag_matches(
+                    A.split_image(img)[2], want_tag):
                 return True, after.get("status") or "running"
-            time.sleep(2)
-        ok_image = A.tag_matches(A.split_image(after.get("image") or "")[2], want_tag)
-        if ok_image:
-            return True, after.get("status") or "running"
-        return False, "仍挂在 %s 上，没切到 %s" % (
-            (owner or {}).get("tag") or "未知", want_tag)
+            time.sleep(gap)
+        img = str(after.get("image") or "")
+        if ":" not in img.rsplit("/", 1)[-1]:
+            owner = A.image_owner(ik, name) or {}
+            if (str(owner.get("repo") or "") == A.repo_of(img)
+                    and A.tag_matches(owner.get("tag"), want_tag)):
+                return True, after.get("status") or "running"
+            return False, "容器 image 没有 tag，记录也对不上（%s）" % img
+        return False, "容器仍声明 %s，没切到 %s" % (A.split_image(img)[2], want_tag)
 
     def _hoist_latest(self, job, ik, ctx, c, insp, repo, ns, iname, new_tag,
                       target_cfg, upstream_src, pull_t):
@@ -842,7 +865,10 @@ class JobManager(object):
 
         # 3. 容器临时切到版本号 tag
         job.step("update", "running", "临时切到 %s:%s" % (iname, vt))
-        p_vt, _ = A.container_payload(c, insp, tag=vt)
+        # 用**当前**容器重新拼 payload：这份快照要带着最新 id，后面第 6 步同理
+        _c_now = self._live(ik, name, c)
+        p_vt, _ = A.container_payload(_c_now, A.get_inspect(ik, _c_now.get("id")),
+                                      tag=vt)
         ik.call("docker_container", "update", p_vt)
         ok_vt, why = self._wait_running(ik, name, vt)
         if not ok_vt:
@@ -901,7 +927,11 @@ class JobManager(object):
 
         # 6. 容器切回 latest
         job.step("update", "running", "切回 %s:%s" % (iname, new_tag))
-        p_lt, _ = A.container_payload(c, insp, tag=new_tag)
+        # 🔴 必须重读容器：第 3 步的 update 已经重建过容器，id 变了。
+        # 拿旧 id 下发，爱快回 Success 却什么都不做（实测），容器会停在版本号 tag 上。
+        _c_now2 = self._live(ik, name, c)
+        p_lt, _ = A.container_payload(_c_now2, A.get_inspect(ik, _c_now2.get("id")),
+                                      tag=new_tag)
         ik.call("docker_container", "update", p_lt)
         ok_lt, why_lt = self._wait_running(ik, name, new_tag)
         if not ok_lt:
@@ -914,9 +944,16 @@ class JobManager(object):
 
         job.step("update", "done", "已切回 %s:%s" % (iname, new_tag))
         job.step("verify", "done", "搬运完成 · %s" % new_tag)
-        job.log("✅ 搬运完成：%s 现在跑 %s:%s，内容为上游最新（%s）；本地 %s 记录已重置。"
-                "搬运用的临时记录 %s:%s 保留着，可当回滚点，也可在爱快「本地镜像」里手动清掉。"
+        # 别承诺「临时记录还在、可当回滚点」—— 爱快会把**同内容的多标签并成一条**
+        # 记录（实测落成 ``tag="latest,v1.19.33"``），根本没有独立的临时记录；
+        # 删这条是连 latest 一起删。如实说清楚。
+        _ow = A.image_owner(ik, name) or {}
+        job.log("✅ 搬运完成：%s 现在跑 %s:%s，内容为上游最新（%s）。\n"
+                "   本地记录：%s 的 tag 是 %r —— 爱快把内容相同的多个标签并成了**一条**记录，"
+                "所以没有「独立的临时记录」可单独清掉（删它等于连 %s 一起删）。\n"
+                "   要回滚：把容器镜像改成 %s:%s 即可（内容还是这份最新的，只是标签不同）。"
                 % (name, iname, new_tag, A.norm_digest(target_cfg)[:12],
+                   _ow.get("name") or iname, _ow.get("tag") or new_tag,
                    new_tag, iname, vt))
         return True, "已搬运到最新内容"
 

@@ -102,7 +102,7 @@ docker compose logs -f              # 看到启动横幅即成功，Ctrl+C 退�
 |---|---|
 | `latest` | main 分支每次推送 |
 | `sha-xxxxxxx` | 每次构建，钉住具体 commit |
-| `1.5.0`、`1.5` | 推 `v1.5.0` 这样的 tag 时 |
+| `1.5.1`、`1.5` | 推 `v1.5.1` 这样的 tag 时 |
 
 > 拉不动 ghcr.io 的话，给镜像名加个加速前缀即可，例如
 > `docker.1ms.run/ghcr.io/utterliar1/idocker:latest`。
@@ -316,14 +316,23 @@ amd64 的内容一个字都没动。只有 `config.digest` 才和本地镜像 ID
 4. 删掉旧的 `repo:latest` 记录（此刻已无容器占用），**回读确认真的删掉了**再往下走；
 5. 重新 `install latest` —— 同名记录已不在，爱快这才真的下载；然后把容器切回 `latest`。
 
+> ⚠️ 第 3 步和第 6 步之间**容器 id 会变**：爱快的 `update` 是拆了重建。拿流程开始时那份
+> 快照的 id 再下发第二次 `update`，爱快会回 `{"code":0,"message":"Success"}` 却**什么都不做**
+> —— 和 `docker_image.del` 一个脾气。所以每次 `update` 前都要重读容器拿当前 id。
+> 判定「切没切过去」同样只认**容器自己声明的 `image`**：一条记录可以同时挂
+> `tag="latest,v1.19.33"`，容器明明还声明着 `v1.19.33`，拿记录标签集合一匹配就成了假成功
+> （2026-10-22 线上真实发生，用户当场发现日志与实际不符）。
+
 执行日志会逐步写清楚在干什么：
 
 ```
 ⚠ clash 本地 metacubex/mihomo:latest 的内容落后于上游，而爱快拒绝重新拉取……
    → 改为「搬运」：拉一个内容相同的版本号 tag，把容器切过去、删掉旧的 latest 记录，再重新拉 latest 并切回来
 ✓ 找到 metacubex/mihomo:v1.19.33，内容与 metacubex/mihomo:latest 相同（命中 https://docker.1ms.run），开始搬运
-✅ 搬运完成：clash 现在跑 metacubex/mihomo:latest，内容为上游最新（6c0efd78a1ea）；本地 latest 记录已重置。
-   搬运用的临时记录 metacubex/mihomo:v1.19.33 保留着，可当回滚点，也可在爱快「本地镜像」里手动清掉。
+✅ 搬运完成：clash 现在跑 metacubex/mihomo:latest，内容为上游最新（6c0efd78a1ea）。
+   本地记录：metacubex/mihomo 的 tag 是 'latest,v1.19.33' —— 爱快把内容相同的多个标签并成了**一条**记录，
+   所以没有「独立的临时记录」可单独清掉（删它等于连 latest 一起删）。
+   要回滚：把容器镜像改成 metacubex/mihomo:v1.19.33 即可（内容还是这份最新的，只是标签不同）。
 ```
 
 **搬运救不了的情况**（工具会如实报失败，不会伪装成功）：
@@ -338,6 +347,12 @@ amd64 的内容一个字都没动。只有 `config.digest` 才和本地镜像 ID
 
 > 判断依据始终是**容器自己声明的 tag**，不是镜像记录的标签集合 —— 用后者会把
 > 「跑在 `1.37.3`、记录上恰好也挂着 `latest`」误当成「已经在用 latest」。
+> 只有容器 `image` 真的不带 tag（早期 `lucky` 那种老数据）时才退回看记录，
+> 并且要求记录的 repo 与容器 `image` 的 repo 一致。
+
+> 顺带一句：`v1.19.33` 这个标签**没有**独立的回滚记录。爱快会把同内容的多标签合并成一条
+> （实测落成 `tag="latest,v1.19.33"`），删这条等于两个标签一起删。要回滚就把容器镜像改成
+> `repo:v1.19.33`，内容不变、只是标签不同。
 > 若那条多标签记录里的内容**已经是最新**，工具就只做「把容器切过去」这一件事（重启一次），
 > 不再傻乎乎地报失败。
 
@@ -548,8 +563,8 @@ push / PR
 发新版本就是打个 tag：
 
 ```bash
-git tag v1.5.0 && git push origin v1.5.0
-# → ghcr.io/utterliar1/idocker:1.5.0 / :1.5 / :latest / :sha-xxxxxxx
+git tag v1.5.1 && git push origin v1.5.1
+# → ghcr.io/utterliar1/idocker:1.5.1 / :1.5 / :latest / :sha-xxxxxxx
 ```
 
 推送 ghcr.io 用的是仓库自带的 `GITHUB_TOKEN`（workflow 里声明了 `packages: write`），

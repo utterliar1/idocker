@@ -90,6 +90,12 @@ class Fake(object):
         # 爱快自己那个「可用版本」接口返回什么（None 表示恒为空，实测 mihomo 就是）
         self.ikuai_tags = ["latest", "1.7.2", "1.8.0"]
         self.del_calls = []
+        # 实测：爱快 update 会重建容器（id 变），拿旧 id 再 update 会被静默忽略
+        # （回 Success 却什么都不做）。默认关，测搬运流程时打开。
+        self.id_changes_on_update = False
+        self.strict_update_id = False
+        self.update_ignored = []
+        self._nid = 0
 
     def digest_for(self, repo, tag):
         return self.digests.get("%s:%s" % (repo, tag), self.digest_default)
@@ -154,11 +160,23 @@ class Fake(object):
                 # 正是「镜像下好了却没切过去」那个 bug 的成因。
                 full = param.get("image") or ""
                 for c in self.containers:
-                    if c["name"] == param.get("name"):
-                        c["image"] = full
-                        c["state"] = "running"
-                        c["status"] = "Up 1 second"
-                        self._attach_owner(c["name"], full)
+                    if c["name"] != param.get("name"):
+                        continue
+                    # 真实爱快的两个脾气（2026-10-22 真机实测）：
+                    #   ① update = 拆除重建，容器 **id 会变**；
+                    #   ② 拿旧 id 下发 → 回 `code:0 Success` 却**什么都不做**。
+                    # 默认关闭，免得影响既有断言；测搬运时打开。
+                    if (self.strict_update_id and param.get("id")
+                            and c.get("id") and param["id"] != c.get("id")):
+                        self.update_ignored.append(dict(param))
+                        return {"code": 0, "message": "Success"}
+                    c["image"] = full
+                    c["state"] = "running"
+                    c["status"] = "Up 1 second"
+                    if self.id_changes_on_update:
+                        self._nid += 1
+                        c["id"] = "sha256:" + ("%064x" % (0xA0B000 + self._nid))
+                    self._attach_owner(c["name"], full)
                 return {}
             if action in ("up", "down", "restart"):
                 return {}
