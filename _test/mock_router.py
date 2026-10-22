@@ -67,6 +67,11 @@ class Fake(object):
         self.image_changed = True
         # 模拟「下载永远完不成」：install 不刷新时间戳
         self.stall = set()
+        # 更细的「爱快回成功但什么都不下」：只静默**一次**，按 "repo:tag" 或 repo 名匹配。
+        # 真实爱快对同名同 tag 的记录就是这脾气 —— 回 {"code":0} 却一个字节不下，
+        # 页面只会看到「拉取时间没更新」。一次性是为了能把「先静默、后真下」的
+        # 搬运流程完整跑通。
+        self.silent_once = set()
         # 模拟容器日志。置空可复现「容器重建了、状态 running，却没有任何输出」
         # 的场景（实测 lucky 换 entrypoint 后启动脚本空转即如此）。
         self.container_logs = ["starting service...", "listening on :8080"]
@@ -208,6 +213,11 @@ class Fake(object):
                 self.install_calls.append((full, tag))
                 if full in self.stall:
                     return {}                    # 只下发任务，不产生任何变化
+                # 「回成功、实际不下」：命中一次就消耗掉
+                for _k in ("%s:%s" % (full, tag), full):
+                    if _k in self.silent_once:
+                        self.silent_once.discard(_k)
+                        return {}
                 # 同 repo + 同 tag（tag 可能是逗号多标签）→ 视为已存在，静默刷新时间戳
                 for img in self.images:
                     if img["name"] != full:

@@ -528,7 +528,8 @@ def wait_for_image(ik, repo, tag, since, timeout, ctx):
             if i.get("name") == repo and str(i.get("tag")) == str(tag):
                 if (i.get("install") or 0) >= since:
                     return True, i
-                note = "镜像已存在但拉取时间未更新（可能本来就是最新）"
+                note = ("镜像记录已存在，但拉取时间没更新 —— 爱快没有真的下载"
+                        "（它对同名同 tag 一律不肯重下，且不比对内容）")
         time.sleep(3)
         if ctx.verbose:
             print("    ... 等待下载，剩余 %ds" % int(deadline - time.time()), flush=True)

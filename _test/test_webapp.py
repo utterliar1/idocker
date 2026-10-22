@@ -148,6 +148,10 @@ mock_router.FAKE.install_calls = []
 # 让上游内容真的比本地新一份（本地 clash 记录是 OLD_ID，上游是 NEW_ID）。
 # 不设的话 mock 会把本地镜像 ID 当上游内容，就成了「本来就没有新版」。
 mock_router.FAKE.configs["dreamacro/clash:latest"] = mock_router.NEW_ID
+# 上游同内容还挂着一个版本号 tag —— 爱快对同名 latest 一律不肯重下，
+# 所以「本地 latest 落后」时流程会走搬运，得给它一个能拉的版本号 tag。
+mock_router.FAKE.configs["dreamacro/clash:2.9.0"] = mock_router.NEW_ID
+mock_router.FAKE.tags["dreamacro/clash"] = ["latest", "2.9.0"]
 # 定时任务先比对上游内容，命中「内容变了」才拉取 + 重启
 mock_router.FAKE.images[0]["id"] = mock_router.OLD_ID
 d, _ = req("/api/schedules", {"action": "run", "id": sc_upd["id"]})
@@ -157,9 +161,16 @@ st = step_states(job)
 ok("更新任务成功", job["ok"] is True, job.get("message"))
 ok("六步全部走完", all(st[k] in ("done", "skipped") for k in
                        ("login", "inspect", "pull", "download", "update", "verify")), st)
-ok("确实调用了 docker_container.update", len(mock_router.FAKE.update_calls) == 1,
+# 本地 latest 落后时走的是搬运：先把容器切到版本号 tag、再切回 latest，
+# 所以 update 会是两次（而不是就地重建一次）。
+ok("确实调用了 docker_container.update", len(mock_router.FAKE.update_calls) >= 1,
    mock_router.FAKE.update_calls)
-ok("容器已切到新镜像 ID", mock_router.FAKE.images[0]["id"] == mock_router.NEW_ID)
+_latest4 = [i for i in mock_router.FAKE.images
+            if i["name"] == "dreamacro/clash" and i.get("tag") == "latest"]
+ok("容器最终跟随 latest", [c for c in mock_router.FAKE.containers
+                        if c["name"] == "clash"][0]["image"] == "dreamacro/clash:latest")
+ok("latest 记录的内容已换成上游最新",
+   len(_latest4) == 1 and _latest4[0]["id"] == mock_router.NEW_ID, _latest4)
 d, _ = req("/api/schedules")
 sc_upd = [x for x in d["data"]["schedules"] if x["id"] == sc_upd["id"]][0]
 ok("任务结果回写为 ok", sc_upd["last_status"] == "ok", sc_upd)
@@ -185,8 +196,20 @@ ok("调度器触发了任务", after > before, "history %d -> %d" % (before, aft
 item = [x for x in d["data"]["schedules"] if x["id"] == sc_upd["id"]][0]
 ok("触发后已重排下一次", item["next_run"] > time.time())
 
-print("\n=== 7. 下载超时：跳过该容器且不影响整批 ===")
-# 让 clash 的下载永远不完成，并把超时压到 3 秒（测试专用，接口下限是 60）
+print("\n=== 7. 下载卡住：跳过该容器且不影响整批 ===")
+# 让所有 install 都变成「回成功但一个字节不下」（下载引擎卡死 / 加速源不通就这表现），
+# 并把超时压到 3 秒（测试专用，接口下限是 60）。
+# 本地 latest 落后 → 预检走搬运 → 搬运要拉的版本号 tag 同样下不来 → 如实失败。
+mock_router.FAKE.images = [i for i in mock_router.FAKE.images
+                           if i["name"] != "dreamacro/clash"]
+mock_router.FAKE.images.append({
+    "name": "dreamacro/clash", "tag": "latest", "id": mock_router.OLD_ID,
+    "install": int(time.time()) - 3600, "created": int(time.time()) - 3600,
+    "size": 1, "namespace": "dreamacro",
+    "containers": [{"name": "clash", "state": "running"}]})
+mock_router.FAKE.configs["dreamacro/clash:latest"] = mock_router.NEW_ID
+mock_router.FAKE.configs["dreamacro/clash:2.9.0"] = mock_router.NEW_ID
+mock_router.FAKE.tags["dreamacro/clash"] = ["latest", "2.9.0"]
 mock_router.FAKE.stall = {"dreamacro/clash"}
 mock_router.FAKE.update_calls = []
 server.CFG["pull_timeout"] = 3
@@ -900,16 +923,24 @@ ok("任务如实判成功", _job33["ok"] is True, _job33.get("message"))
 ok("日志说明了「记录本来就含 latest，只是把容器切过去」",
    "本来就含" in _log33, _log33[-260:])
 
-print("\n=== 33b. 同一个 tag 的内容真的落后：必须如实报失败 ===")
-# 反向对照：本地这份 `clash:2.0.0` 是旧内容，上游同 tag 换了新内容，爱快又拒绝重拉。
-# 同 tag 无法原地刷新，此时**不能**假装成功，也不能白重启一次容器。
+print("\n=== 33b. 同一个 tag 的内容真的落后：能删就删了重下，删不掉才报失败 ===")
+# 「同名同 tag 但内容不同」在真实世界少见（源覆盖了 tag），一旦发生，爱快不会重下。
+# 处理要分两种，全看这条记录上还挂着容器没有：
+#   · 空着 → 删掉重下，把新内容拿进来（旧代码只会报失败，白让用户手动去爱快后台删）；
+#   · 被容器占用 → del 会被安全阀拦下（删记录会连带删容器，10-22 出过事故），
+#     此时如实报失败并指路，绝不拿旧镜像重建假装成功。
 _clash33 = [c for c in mock_router.FAKE.containers if c["name"] == "clash"][0]
 _clash33["image"] = "dreamacro/clash:2.0.0"
-_clash_img = [i for i in mock_router.FAKE.images
-              if i["name"] == "dreamacro/clash" and "2.0.0" in str(i.get("tag") or "")][0]
-_clash_img["id"] = mock_router.OLD_ID
+mock_router.FAKE.images = [i for i in mock_router.FAKE.images
+                           if i["name"] != "dreamacro/clash"]
+mock_router.FAKE.images.append({
+    "name": "dreamacro/clash", "tag": "2.0.0", "id": mock_router.OLD_ID,
+    "install": int(time.time()) - 3600, "created": int(time.time()) - 3600,
+    "size": 1, "namespace": "dreamacro", "containers": []})
 mock_router.FAKE.configs["dreamacro/clash:2.0.0"] = mock_router.MID_ID
 mock_router.FAKE.update_calls = []
+mock_router.FAKE.install_calls = []
+mock_router.FAKE.del_calls = []
 mock_router.FAKE.install_existing_error = True
 try:
     _j33b = server.MANAGER.create("update", ["clash"], "2.0.0", auto=False)
@@ -920,19 +951,54 @@ _st33b = step_states(_job33b)
 _log33b = " ".join(x.get("message") or ""
                    for x in _jobs_mod.JobManager._extract_logs(
                        server.MANAGER.jobs[_j33b.id]))
-ok("同 tag 内容落后时如实报失败", _st33b["update"] == "failed", _st33b)
+_inst33b = list(mock_router.FAKE.install_calls)
+
+ok("记录空着时先把旧记录删掉再重下", any(
+    d.get("name") == "dreamacro/clash" and d.get("tag") == "2.0.0"
+    for d in mock_router.FAKE.del_calls), mock_router.FAKE.del_calls)
+ok("日志说明了这一步", "改为重新下载" in _log33b, _log33b[-300:])
+ok("重下之后确实重建了容器（拿到的是新内容，不是旧的）",
+   len(mock_router.FAKE.update_calls) == 1, mock_router.FAKE.update_calls)
+ok("任务成功", _job33b["ok"] is True, _job33b.get("message"))
+
+print("\n=== 33c. 同 tag 记录被容器占着：删不掉就如实报失败，绝不用旧镜像重建 ===")
+mock_router.FAKE.images = [i for i in mock_router.FAKE.images
+                           if i["name"] != "dreamacro/clash"]
+mock_router.FAKE.images.append({
+    "name": "dreamacro/clash", "tag": "2.0.0", "id": mock_router.OLD_ID,
+    "install": int(time.time()) - 3600, "created": int(time.time()) - 3600,
+    "size": 1, "namespace": "dreamacro",
+    "containers": [{"name": "clash", "state": "running"}]})
+mock_router.FAKE.configs["dreamacro/clash:2.0.0"] = mock_router.MID_ID
+mock_router.FAKE.update_calls = []
+mock_router.FAKE.del_calls = []
+mock_router.FAKE.install_existing_error = True
+try:
+    _j33c = server.MANAGER.create("update", ["clash"], "2.0.0", auto=False)
+    _job33c = wait_job(_j33c.id)
+finally:
+    mock_router.FAKE.install_existing_error = False
+_st33c = step_states(_job33c)
+_log33c = " ".join(x.get("message") or ""
+                   for x in _jobs_mod.JobManager._extract_logs(
+                       server.MANAGER.jobs[_j33c.id]))
+ok("占用中的记录不会被删", any(
+    i["name"] == "dreamacro/clash" for i in mock_router.FAKE.images))
+ok("如实报失败（下载 failed、容器一步不动）",
+   _st33c["download"] == "failed" and _job33c["ok"] is False, _st33c)
 ok("不去用旧镜像重建容器", len(mock_router.FAKE.update_calls) == 0,
    mock_router.FAKE.update_calls)
-ok("任务整体判失败", _job33b["ok"] is False, _job33b.get("message"))
-ok("明说了「同 tag 的记录已存在、拒绝重新拉取」",
-   "拒绝重新拉取" in _log33b, _log33b[-260:])
-ok("给出了可操作的下一步（去爱快「本地镜像」删记录）",
-   "本地镜像" in _log33b, _log33b[-260:])
-ok("没有把「拒绝拉取」说成「已是最新」",
-   "已是最新" not in _log33b, _log33b[-260:])
+ok("指路去爱快「本地镜像」手动删", "本地镜像" in _log33c, _log33c[-300:])
+ok("没有把「拒绝拉取」说成「已是最新」", "已是最新" not in _log33c, _log33c[-300:])
 # 还原，免得影响后面
 mock_router.FAKE.configs.pop("dreamacro/clash:2.0.0", None)
-_clash_img["id"] = mock_router.NEW_ID
+mock_router.FAKE.images = [i for i in mock_router.FAKE.images
+                           if i["name"] != "dreamacro/clash"]
+mock_router.FAKE.images.append({
+    "name": "dreamacro/clash", "tag": "latest", "id": mock_router.NEW_ID,
+    "install": int(time.time()), "created": int(time.time()), "size": 1,
+    "namespace": "dreamacro",
+    "containers": [{"name": "clash", "state": "running"}]})
 _clash33["image"] = "dreamacro/clash:latest"
 
 print("\n=== 34. 检测基准不再「自我消化」：本地内容没变，就一直报有新版本 ===")
@@ -1018,8 +1084,11 @@ ok("容器先被切到版本号 tag 再切回 latest",
 ok("删除过旧的 latest 记录（并用完整 repo 名 + 真实 tag）",
    any(d.get("name") == "dreamacro/clash" and d.get("tag") == "latest"
        for d in mock_router.FAKE.del_calls), mock_router.FAKE.del_calls)
-ok("重新拉过一次 latest", sum(1 for x in _inst35
-                          if x == ("dreamacro/clash", "latest")) >= 2, _inst35)
+# 预检已经知道「本地 latest 落后」，所以不会再傻乎乎先 install 一次 latest 撞墙；
+# 搬运里那次重新 install latest 才是唯一一次（记录刚被删，这次是真下载）。
+ok("重新 install 过 latest（删掉旧记录之后）", sum(1 for x in _inst35
+                                          if x == ("dreamacro/clash", "latest")) >= 1,
+   _inst35)
 ok("最终 latest 记录的内容是上游最新那份",
    len(_lt35) == 1 and _lt35[0]["id"] == mock_router.NEW_ID, _lt35)
 ok("容器最终仍跟随 latest", _clash35b["image"] == "dreamacro/clash:latest",
@@ -1262,6 +1331,94 @@ ok("精确查不会认领（目标 tag 确实不存在）",
    A.exact_image(_ik, "onlyrepo/app", "9.9.9") is None)
 ok("精确查能查到真实存在的那条",
    (A.exact_image(_ik, "onlyrepo/app", "latest") or {}).get("id") == mock_router.NEW_ID)
+
+print("\n=== 40. 爱快「回成功但一个字节不下」：预检直接搬运，不空等下载超时 ===")
+# 线上 2026-10-22 11:37 ddnsto 就是这么「失败」的：
+#   install 没报「已存在相同内容」，爱快回成功（还下发了个任务），实际什么都没下。
+#   于是 already=False → 流程进 wait_for_image 盲等，直到 pull_timeout 耗尽，
+#   最后吐一句「镜像已存在但拉取时间未更新（可能本来就是最新）」——
+#   可检测刚说过有新版本，这句纯属误导。
+# 现在 install 之前先核内容：确实落后 + latest → 直接搬运，根本不给它空跑的机会。
+_clash40 = [c for c in mock_router.FAKE.containers if c["name"] == "clash"][0]
+_clash40["image"] = "dreamacro/clash:latest"
+mock_router.FAKE.images = [i for i in mock_router.FAKE.images
+                           if i["name"] != "dreamacro/clash"]
+mock_router.FAKE.images.append({
+    "name": "dreamacro/clash", "tag": "latest", "id": mock_router.OLD_ID,
+    "install": int(time.time()) - 86400, "created": int(time.time()) - 86400,
+    "size": 1, "namespace": "dreamacro",
+    "containers": [{"name": "clash", "state": "running"}]})
+mock_router.FAKE.configs["dreamacro/clash:latest"] = mock_router.NEW_ID
+mock_router.FAKE.configs["dreamacro/clash:2.9.0"] = mock_router.NEW_ID
+mock_router.FAKE.tags["dreamacro/clash"] = ["latest", "2.9.0"]
+mock_router.FAKE.update_calls = []
+mock_router.FAKE.install_calls = []
+mock_router.FAKE.del_calls = []
+mock_router.FAKE.install_existing_error = False   # 关键：这次爱快**不报错**
+_old_pt40 = server.MANAGER.cfg.get("pull_timeout")
+server.MANAGER.cfg["pull_timeout"] = 1
+try:
+    _j40 = server.MANAGER.create("update", ["clash"], None, auto=False)
+    _job40 = wait_job(_j40.id)
+finally:
+    server.MANAGER.cfg["pull_timeout"] = _old_pt40
+_st40 = step_states(_job40)
+_log40 = " ".join(x.get("message") or ""
+                  for x in _jobs_mod.JobManager._extract_logs(
+                      server.MANAGER.jobs[_j40.id]))
+_inst40 = list(mock_router.FAKE.install_calls)
+_lt40 = [i for i in mock_router.FAKE.images
+         if i["name"] == "dreamacro/clash" and i.get("tag") == "latest"]
+_clash40b = [c for c in mock_router.FAKE.containers if c["name"] == "clash"][0]
+
+ok("预检抢在 install 之前：第一次拉的就是版本号 tag，不是 latest",
+   _inst40 and _inst40[0] == ("dreamacro/clash", "2.9.0"), _inst40)
+ok("日志点明「直接走搬运，不空等下载超时」", "直接走搬运" in _log40, _log40[-320:])
+ok("任务成功、latest 记录换成上游最新内容",
+   _job40["ok"] is True and len(_lt40) == 1 and _lt40[0]["id"] == mock_router.NEW_ID,
+   (_job40.get("message"), _lt40))
+ok("容器仍跟随 latest", _clash40b["image"] == "dreamacro/clash:latest",
+   _clash40b["image"])
+ok("不再出现「可能本来就是最新」这种误导文案", "可能本来就是最新" not in _log40,
+   _log40[-320:])
+mock_router.FAKE.tags.pop("dreamacro/clash", None)
+mock_router.FAKE.configs.pop("dreamacro/clash:2.9.0", None)
+mock_router.FAKE.images = [i for i in mock_router.FAKE.images
+                           if i["name"] != "dreamacro/clash" or i.get("tag") == "latest"]
+
+print("\n=== 41. 等到超时但内容本来就一致：这是假失败，应当继续而不是报错 ===")
+# 爱快「重新登记但不刷新 install 时间」时，wait_for_image 会超时并吐出
+# 「拉取时间没更新」。可内容明明和上游一致 —— 此时报失败毫无道理，
+# 正确反应是「无需下载」，接着核对容器。
+_clash41 = [c for c in mock_router.FAKE.containers if c["name"] == "clash"][0]
+_clash41["image"] = "dreamacro/clash:latest"
+for _i41 in mock_router.FAKE.images:
+    if _i41["name"] == "dreamacro/clash":
+        _i41["id"] = mock_router.NEW_ID
+        _i41["tag"] = "latest"
+        _i41["containers"] = [{"name": "clash", "state": "running"}]
+mock_router.FAKE.configs["dreamacro/clash:latest"] = mock_router.NEW_ID
+mock_router.FAKE.update_calls = []
+mock_router.FAKE.install_calls = []
+mock_router.FAKE.silent_once = {"dreamacro/clash:latest"}
+_old_pt41 = server.MANAGER.cfg.get("pull_timeout")
+server.MANAGER.cfg["pull_timeout"] = 1
+try:
+    _j41 = server.MANAGER.create("update", ["clash"], None, auto=False)
+    _job41 = wait_job(_j41.id)
+finally:
+    server.MANAGER.cfg["pull_timeout"] = _old_pt41
+    mock_router.FAKE.silent_once = set()
+_st41 = step_states(_job41)
+_log41 = " ".join(x.get("message") or ""
+                  for x in _jobs_mod.JobManager._extract_logs(
+                      server.MANAGER.jobs[_j41.id]))
+
+ok("任务判成功（内容一致就不该报失败）", _job41["ok"] is True, _job41.get("message"))
+ok("下载步骤不是 failed", _st41["download"] != "failed", _st41)
+ok("日志说明「本地内容已与上游一致，无需下载」", "无需下载" in _log41, _log41[-320:])
+ok("没有重启容器（内容没变、容器本来就在用）", not mock_router.FAKE.update_calls,
+   mock_router.FAKE.update_calls)
 
 # ---- 收尾：把还在跑的任务等完、把两个 HTTP 服务关掉再退出 ----
 # 否则守护线程会在解释器最终化时被硬杀，容易在退出阶段炸掉（CI 上实测 exit 139，

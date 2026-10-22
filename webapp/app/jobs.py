@@ -433,6 +433,61 @@ class JobManager(object):
                     job.log("内容没有变化，但容器还挂在 %s 上 → 仍然要重启才能切到 %s"
                             % (cur_tag, new_tag), level="warn")
 
+            # 干跑开关跟随本次任务：手动请求传来什么就是什么；定时任务没传，
+            # 回退到环境变量 DRY_RUN 的默认值。绝不读/写全局可变状态。
+            dry = job.dry if job.dry is not None else bool(cfg.get("dry_run"))
+
+            # ---- 预检：本地已有同名同 tag 的记录，而内容确实落后于上游 ----
+            # 爱快判断「要不要下载」只看**同名同 tag 的本地记录在不在**，不比对内容。
+            # 而它表达「我不下」的方式有两种，第二种极其坑人：
+            #   ① 回 `已存在相同内容 该镜像已存在，请勿重复下载` → 走下面 already 分支；
+            #   ② **回成功**、也下发一条任务，实际一个字节都不下 → 落到下面
+            #      wait_for_image 白白等满整个下载超时（默认 900 秒），最后只吐一句
+            #      「镜像已存在但拉取时间未更新（可能本来就是最新）」。
+            #      可检测刚刚明明说「有新版本」—— 这句话纯属误导。
+            #      2026-10-22 11:37 ddnsto 线上就是这么「失败」的。
+            #
+            # 所以在 install 之前就核一次内容：确实落后就别指望爱快，直接分情况处理，
+            # 不空等一整个下载超时。
+            if not dry:
+                _pre = A.exact_image(ik, repo, new_tag)
+                if _pre:
+                    _pstale, upstream, _pcfg, upstream_src = stale_of(new_tag)
+                    if _pstale is True:
+                        if new_tag == "latest":
+                            job.log("⚠ 本地 %s:%s 的内容落后于上游，而爱快对同名 tag 一律"
+                                    "不肯重新下载（有时连错都不报，只是空跑）"
+                                    "→ 直接走搬运，不空等下载超时"
+                                    % (iname, new_tag), level="warn")
+                            job.step("pull", "done", "改走搬运（本地记录内容落后）")
+                            _ok, _msg = self._hoist_latest(job, ik, ctx, c, insp, repo, ns,
+                                                           iname, new_tag, _pcfg,
+                                                           upstream_src, pull_t)
+                            if _ok:
+                                self._remember_if_known(digest_key, upstream, upstream_src)
+                            else:
+                                failures.append(c["name"])
+                            continue
+                        # 版本号 tag 同样无法「原地刷新」：同名同 tag 的记录在，爱快就不下。
+                        # 先试着删掉这条旧记录再重拉 —— del_local_image 带安全阀，
+                        # 记录上还挂着容器会直接拒删，不会出现「删记录顺带删容器」。
+                        _okd, _detail = A.del_local_image(ik, repo, new_tag)
+                        if not _okd:
+                            job.step("download", "failed", "爱快拒绝重下同名同 tag 镜像")
+                            job.step("update", "skipped", "未改动容器")
+                            job.step("verify", "skipped", "容器保持原状")
+                            self._remember_if_known(digest_key, upstream, upstream_src)
+                            job.log("❌ 本地 %s:%s 的内容是旧的，而爱快认为同名 tag 的记录"
+                                    "已存在、不会重新下载；想删掉这条记录也不行（%s）。\n"
+                                    "   请到爱快后台「Docker → 本地镜像」手动删掉它后重试；"
+                                    "或改用「指定版本」换一个 tag。"
+                                    % (iname, new_tag, _detail), level="error")
+                            failures.append(c["name"])
+                            continue
+                        job.log("本地 %s:%s 的内容与上游不同、同 tag 又无法原地刷新 → "
+                                "已删掉这条旧记录，改为重新下载（%s）"
+                                % (iname, new_tag, _detail), level="warn")
+
             # 3. 拉镜像
             job.step("pull", "running", "拉取 %s:%s" % (iname, new_tag))
             payload, unmapped = A.container_payload(c, insp, tag=new_tag)
@@ -446,9 +501,6 @@ class JobManager(object):
                 job.log("容器声明了 %d 个端口但未做宿主映射（doc_docker 路由直连，属正常）"
                         % unmapped, level="warn")
             since = int(time.time())
-            # 干跑开关跟随本次任务：手动请求传来什么就是什么；定时任务没传，
-            # 回退到环境变量 DRY_RUN 的默认值。绝不读/写全局可变状态。
-            dry = job.dry if job.dry is not None else bool(cfg.get("dry_run"))
             already = False
             # 拉取前先记下本地镜像的内容指纹（镜像 ID）
             sig_before = "" if dry else A.image_signature(ik, repo, new_tag)
@@ -610,14 +662,41 @@ class JobManager(object):
                     job.step("download", "done", "镜像已就绪 %.1f MB" % size)
                     job.log("镜像下载完成（%.1f MB）" % size)
                 else:
-                    job.step("download", "failed", note or "超时")
-                    self._remember_if_known(digest_key, upstream, upstream_src)
-                    job.log("❌ %s 的镜像未在 %ds 内下载完成（%s）。本次跳过该容器，"
-                            "不会用旧镜像重建。若镜像较大或加速源较慢，"
-                            "可在页面的「设置」里把下载超时调大后重试。"
-                            % (c["name"], pull_t, note or "超时"), level="error")
-                    failures.append(c["name"])
-                    continue
+                    # 超时了，但「超时」有两种完全不同的成因，不能混为一谈：
+                    #   · 真的在下载，只是慢；
+                    #   · **爱快根本没下载**（同名 tag 的记录在，它回成功但一个字节都不下）。
+                    # 再核一次内容：本地已经等于上游 → 本就无需下载，继续核对容器即可
+                    # （这是「假失败」）；确实落后 → 明说爱快没下，别让用户去调超时白折腾
+                    # （引擎卡死时超时调多大都没用）。
+                    _astale, _aup, _acfg, _asrc = stale_of(new_tag)
+                    if _astale is False:
+                        job.step("download", "done", "本地内容已与上游一致，无需下载")
+                        job.log("⚠ 爱快没在 %ds 内刷新拉取时间，但本地内容已与上游一致"
+                                "（%s），无需下载 —— 继续核对容器"
+                                % (pull_t, A.norm_digest(_acfg)[:12]), level="warn")
+                        upstream = upstream or _aup
+                        upstream_src = upstream_src or _asrc
+                    else:
+                        job.step("download", "failed", note or "超时")
+                        self._remember_if_known(digest_key, upstream, upstream_src)
+                        if _astale is True:
+                            job.log("❌ %s 的 %s 没在 %ds 内下载完成，而且本地内容确实落后"
+                                    "于上游（%s ≠ %s）—— 爱快**根本没有真的下载**，"
+                                    "不是「本来就是最新」。\n"
+                                    "   常见原因：下载任务卡在 task_queue（status=3 "
+                                    "progress=10 长期不动）、加速源不通，或 Docker 服务异常。"
+                                    "请到爱快后台看「下载任务」的报错；必要时把 Docker "
+                                    "服务停一下再启动（docker_server down → up）后重试。"
+                                    % (c["name"], new_tag, pull_t,
+                                       A.norm_digest(local_sig(new_tag))[:12] or "无",
+                                       A.norm_digest(_acfg)[:12] or "未知"), level="error")
+                        else:
+                            job.log("❌ %s 的镜像未在 %ds 内下载完成（%s）。本次跳过该容器，"
+                                    "不会用旧镜像重建。若镜像较大或加速源较慢，"
+                                    "可在页面的「设置」里把下载超时调大后重试。"
+                                    % (c["name"], pull_t, note or "超时"), level="error")
+                        failures.append(c["name"])
+                        continue
 
             # 爱快对「已是最新」的镜像有时报错、有时只是重新登记并刷新 install 时间，
             # 所以不能只看错误或时间戳。比对镜像 ID（内容指纹）才可靠。
