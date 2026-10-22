@@ -42,3 +42,8 @@ Thumbs.db
 # ---------- 本地临时排查 ----------
 _test/lucky_backup_*.json
 scratch/
+_tmp_*.py
+
+# 写死家宽 IPv6 / 域名的本机脚本（idocker 是公开仓库，刻意不入库）
+_test/acl_open_lucky_v6.py
+_test/verify_lucky_web.py

@@ -368,6 +368,19 @@ a { color: var(--primary); }
 /* 确认框底部只有两个按钮，靠右放；其它弹窗保持「左说明右按钮」 */
 #cfmModal .modal-foot { justify-content: flex-end; gap: 8px; }
 .modal-body { padding: 16px 18px; overflow-y: auto; }
+/* 手填 tag —— 爱快/加速源都给不出列表时，用户得能自己填 */
+.tag-manual { margin-bottom: 14px; }
+.tag-manual label { display: block; font-size: 12.5px; margin-bottom: 6px; }
+.tag-manual input[type="text"] {
+  width: 100%; box-sizing: border-box; padding: 8px 11px;
+  border: 1px solid var(--border-strong); border-radius: 7px;
+  background: var(--card); color: var(--text); font-family: var(--mono); font-size: 13px;
+}
+.tag-manual input[type="text"]:focus {
+  outline: none; border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-soft);
+}
+.tag-hint { font-size: 12px; margin-top: 6px; }
 .tag-grid { display: flex; flex-wrap: wrap; gap: 7px; }
 .tag-chip {
   padding: 5px 11px; border: 1px solid var(--border-strong); border-radius: 7px;

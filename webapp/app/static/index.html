@@ -178,9 +178,17 @@
       <strong id="tagTitle">选择版本</strong>
       <button class="btn tiny ghost" id="btnCloseTag">关闭</button>
     </div>
-    <div class="modal-body" id="tagBody">加载中…</div>
+    <div class="modal-body">
+      <div class="tag-manual">
+        <label class="muted" for="tagManual">直接填 tag（列表里没有就填这里，优先于点选）</label>
+        <input type="text" id="tagManual" class="mono" placeholder="例如 latest / 1.19.33 / alpine"
+               autocomplete="off" spellcheck="false">
+        <div class="muted tag-hint" id="tagHint"></div>
+      </div>
+      <div id="tagBody">加载中…</div>
+    </div>
     <div class="modal-foot">
-      <span class="muted">留空则按原 tag 更新</span>
+      <span class="muted">不填则按原 tag 更新</span>
       <button class="btn primary" id="btnTagConfirm">更新到此版本</button>
     </div>
   </div>

@@ -9,6 +9,7 @@
 只用于本地测试，不参与镜像构建（.dockerignore 已排除 _test）。
 """
 
+import hashlib
 import json
 import re
 import threading
@@ -18,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 DIGEST = "sha256:" + "c" * 64
 OLD_ID = "sha256:" + "0" * 64
 NEW_ID = "sha256:" + "1" * 64
+MID_ID = "sha256:" + "3" * 64
 
 
 def split_full(image):
@@ -76,9 +78,45 @@ class Fake(object):
         # —— 这正是「容器锁在固定版本，检测永远说已是最新」那个场景。
         self.digests = {}
         self.digest_default = DIGEST
+        # 上游「内容指纹」（amd64 子清单里的 config.digest，等于本地镜像 ID 那一层）。
+        # 不显式指定时：若本地已有同名同 tag 的记录就当作「上游和它一致」——
+        # 「没变化」是绝大多数情况，这样每个测试不用逐条铺数据。
+        self.configs = {}
+        self.config_default = NEW_ID
+        # 内存里的「子清单 digest → (repo, tag)」映射，模拟多架构 index 下钻
+        self.sub_map = {}
+        # 各仓库的上游 tag 列表；不指定时按本地镜像记录推出来
+        self.tags = {}
+        # 爱快自己那个「可用版本」接口返回什么（None 表示恒为空，实测 mihomo 就是）
+        self.ikuai_tags = ["latest", "1.7.2", "1.8.0"]
+        self.del_calls = []
 
     def digest_for(self, repo, tag):
         return self.digests.get("%s:%s" % (repo, tag), self.digest_default)
+
+    def config_for(self, repo, tag):
+        key = "%s:%s" % (repo, tag)
+        if key in self.configs:
+            return self.configs[key]
+        for img in self.images:
+            if img.get("name") != repo:
+                continue
+            if tag in [t.strip() for t in str(img.get("tag") or "").split(",")]:
+                return img.get("id") or self.config_default
+        return self.config_default
+
+    def tags_for(self, repo):
+        if repo in self.tags:
+            return list(self.tags[repo])
+        out = []
+        for img in self.images:
+            if img.get("name") != repo:
+                continue
+            for t in str(img.get("tag") or "").split(","):
+                t = t.strip()
+                if t and t not in out:
+                    out.append(t)
+        return out
 
     # -- 动作 ------------------------------------------------------
     def _attach_owner(self, container_name, full_image):
@@ -127,8 +165,22 @@ class Fake(object):
         if func == "docker_image":
             if action == "show":
                 if param.get("TYPE") == "tag":
-                    return {"code": 0, "results": {"tag_list": ["latest", "1.7.2", "1.8.0"]}}
+                    tags = list(self.ikuai_tags or [])
+                    return {"code": 0, "results": {"tag_list": tags}}
                 return {"code": 0, "results": {"data": self.images}}
+            if action == "del":
+                # 真实爱快只认「完整 repo 名 + 真实 tag」，对不上就静默成功但什么都不删。
+                # 这里如实模拟：匹配不到时也回 Success，让上层必须回读确认。
+                self.del_calls.append(dict(param))
+                name, tag = param.get("name") or "", param.get("tag") or ""
+                keep = []
+                for img in self.images:
+                    if img["name"] == name and tag in [
+                            t.strip() for t in str(img.get("tag") or "").split(",")]:
+                        continue
+                    keep.append(img)
+                self.images = keep
+                return {"code": 0, "message": "Success"}
             if action == "install":
                 # 爱快的 param 是 namespace + name 分开传的，这里要拼回去
                 ns = param.get("namespace") or ""
@@ -149,11 +201,12 @@ class Fake(object):
                                     "message": "已存在相同内容 该镜像已存在，请勿重复下载"}
                         img["install"] = int(time.time())
                         if self.image_changed:
-                            img["id"] = NEW_ID
+                            img["id"] = self.config_for(full, tag)
                         return {}
                 # 新 tag → 单独一条镜像（真实爱快就是这样：
                 # lucky 的 "2.27.2" 和 "2.20.2,latest" 是两条独立记录、两个不同 ID）
-                self.images.append({"name": full, "tag": tag, "id": NEW_ID,
+                self.images.append({"name": full, "tag": tag,
+                                    "id": self.config_for(full, tag),
                                     "install": int(time.time()),
                                     "created": int(time.time()), "size": 1024,
                                     "namespace": ns, "containers": []})
@@ -190,19 +243,48 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _raw(self, body, headers=None):
+        self.send_response(200)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        if not (headers or {}).get("Content-Type"):
+            self.send_header("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
     def do_GET(self):
-        # 极简 registry：/v2/<repo...>/manifests/<tag>
+        # 极简 registry：/v2/<repo...>/manifests/<tag 或 digest>、/v2/<repo...>/tags/list
+        m = re.match(r"^/v2/(.+)/tags/list", self.path)
+        if m:
+            repo = m.group(1)
+            return self._json({"name": repo, "tags": FAKE.tags_for(repo)})
         m = re.match(r"^/v2/(.+)/manifests/([^/?]+)", self.path)
         if m:
-            repo, tag = m.group(1), m.group(2)
-            body = b""
-            self.send_response(200)
-            self.send_header("Docker-Content-Digest", FAKE.digest_for(repo, tag))
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            if body:
-                self.wfile.write(body)
-            return
+            repo, ref = m.group(1), m.group(2)
+            # 子清单（多架构里某个平台的 manifest）：正文里带本平台那份的 config.digest
+            if ref in FAKE.sub_map:
+                srepo, stag = FAKE.sub_map[ref]
+                body = json.dumps({
+                    "schemaVersion": 2,
+                    "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                    "config": {"mediaType": "application/vnd.docker.container.image.v1+json",
+                               "size": 1, "digest": FAKE.config_for(srepo, stag)},
+                    "layers": []}).encode()
+                return self._raw(body)
+            # tag → index（多架构清单），指向本测试桩里合成的 amd64 子清单
+            sub = "sha256:" + hashlib.sha256(
+                ("sub|%s|%s" % (repo, ref)).encode()).hexdigest()
+            FAKE.sub_map[sub] = (repo, ref)
+            body = json.dumps({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+                "manifests": [{
+                    "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                    "digest": sub, "size": 1,
+                    "platform": {"architecture": "amd64", "os": "linux"}}]}).encode()
+            return self._raw(body, {"Docker-Content-Digest": FAKE.digest_for(repo, ref)})
         self._json({"code": 0})
 
     def do_POST(self):

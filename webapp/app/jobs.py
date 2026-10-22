@@ -343,8 +343,42 @@ class JobManager(object):
 
         # 上游检测统一用「爱快自己配置的加速源」——检测的源必须和拉取的源一致，
         # 否则会出现「页面说有新版、爱快点下去却拉不到」的错位。
-        # 非 auto 任务用不到远程比对，省一次接口调用。
-        registries = A.resolve_registries(ik, cfg, job.log) if job.auto else None
+        # 手动点击时只有在「爱快拒绝重新拉取」时才需要查上游，所以做成用到才查。
+        _regs = {"v": None}
+
+        def registries():
+            if _regs["v"] is None:
+                try:
+                    _regs["v"] = A.resolve_registries(ik, cfg, job.log)
+                except Exception as e:                      # noqa: BLE001
+                    _regs["v"] = []
+                    job.log("读取加速源失败（%s），本轮不查上游" % e, level="warn")
+            return _regs["v"]
+
+        def local_sig(tag):
+            """本地 repo:tag 记录的镜像 ID —— 和上游 config.digest 同层可比。"""
+            return A.image_signature(ik, repo, tag)
+
+        def upstream_of(tag):
+            """查上游，返回 (manifest digest, amd64 config digest, 命中的源)。"""
+            try:
+                return A.remote_platform_digest(registries(), repo, tag, ctx,
+                                                cfg["timeout"])
+            except Exception as e:                          # noqa: BLE001
+                job.log("上游内容查询失败（%s）" % e, level="warn")
+                return "", "", ""
+
+        def stale_of(tag):
+            """本地内容 vs 上游内容，返回 True=落后 / False=一致 / None=判不了。"""
+            _man, _cfg, _src = upstream_of(tag)
+            _ls = local_sig(tag)
+            if not (A.norm_digest(_ls) and A.norm_digest(_cfg)):
+                return None, _man, _cfg, _src
+            if not A.same_content(_ls, _cfg):
+                job.log("本地镜像 %s ≠ 上游内容 %s（命中 %s）—— 本地这份是旧的"
+                        % (A.norm_digest(_ls)[:12], A.norm_digest(_cfg)[:12],
+                           _src or "上游"), level="warn")
+            return A.same_content(_ls, _cfg) is False, _man, _cfg, _src
 
         # 一个容器失败不再中断整批：定时任务里最怕「一个卡住整晚白跑」，
         # 所以单个容器出错只记账，继续处理后面的。
@@ -358,30 +392,42 @@ class JobManager(object):
             repo = A.repo_of(c["image"])
             digest_key = "%s:%s" % (repo, new_tag)
             upstream, upstream_src = "", ""
+            pull_t = int(cfg.get("pull_timeout") or 900)
+            # 容器在不在用目标 tag —— 只看容器**自己声明的 tag**（理由见下方长注释）。
+            # 提前到这里，是因为上面「定时先看上游变没变」也要用它。
+            using_it = (cur_tag == new_tag)
 
-            # 定时任务（auto）先看上游到底变没变。只有 digest 变化才值得走一遍
-            # 拉取 + 重启；否则每次定时跑都重启容器会平白中断服务 —— 爱快对
-            # 「镜像已是最新」的判断并不总是可靠，不能指望它来兜底。
+            # 定时任务（auto）先看本地镜像和上游**内容**是不是同一份。只有真的不同
+            # 才值得走一遍拉取 + 重启；否则每次定时跑都重启容器会平白中断服务。
+            #
+            # 判据从「上游 digest vs 自己上次记的 digest」改成「本地镜像 ID vs 上游
+            # amd64 的 config.digest」—— 前者是拿自己记的数字跟自己比：上游一变就
+            # 把新 digest 记成基准，报告被自我消化，于是永远报「已是最新」（线上
+            # 踩过：mihomo 报过一次之后永久安静）。后者才回答得了「本地这份落后没有」。
             if job.auto:
-                job.step("pull", "running", "比对上游版本")
-                try:
-                    upstream, upstream_src = A.remote_digest(
-                        registries, repo, new_tag, ctx, cfg["timeout"])
-                except Exception as e:                      # noqa: BLE001
-                    upstream, upstream_src = "", ""
-                    job.log("上游版本查询失败（%s），退回按实际拉取结果判断" % e, level="warn")
-                known = self._seen_digest(digest_key)
-                if upstream and known and upstream == known:
-                    job.step("pull", "skipped", "上游未变化")
+                job.step("pull", "running", "比对上游内容")
+                _stale, upstream, _up_cfg, upstream_src = stale_of(new_tag)
+                if _stale is None and upstream:
+                    # 源没给清单正文 → 退回「上游清单 digest 有没有变」
+                    _known = self._seen_digest(digest_key)
+                    if _known is None:
+                        job.log("没有 %s 的历史记录，按实际拉取结果决定是否重启"
+                                % digest_key)
+                    elif _known == upstream:
+                        _stale = False
+                if _stale is False and using_it:
+                    job.step("pull", "skipped", "内容未变化")
                     job.step("download", "skipped", "无需下载")
-                    job.step("update", "skipped", "上游无新版本，跳过重启")
+                    job.step("update", "skipped", "内容无变化，跳过重启")
                     job.step("verify", "skipped", "容器保持原状")
                     cur = {x["name"]: x for x in A.get_containers(ik)}.get(c["name"]) or {}
-                    job.log("✅ %s 上游镜像未变化（%s），跳过更新，容器不重启（当前：%s）"
-                            % (c["name"], upstream_src or "上游", cur.get("status") or "运行中"))
+                    job.log("✅ %s 本地镜像与上游是同一份内容（%s），跳过更新，容器不重启"
+                            "（当前：%s）" % (c["name"], upstream_src or "上游",
+                                             cur.get("status") or "运行中"))
                     continue
-                if upstream and not known:
-                    job.log("没有 %s 的历史版本记录，按实际拉取结果决定是否重启" % digest_key)
+                if _stale is False and not using_it:
+                    job.log("内容没有变化，但容器还挂在 %s 上 → 仍然要重启才能切到 %s"
+                            % (cur_tag, new_tag), level="warn")
 
             # 3. 拉镜像
             job.step("pull", "running", "拉取 %s:%s" % (iname, new_tag))
@@ -410,8 +456,8 @@ class JobManager(object):
                 # 爱快在镜像已是最新时会返回「已存在相同内容」类错误，这不是失败
                 if A.is_already_exists(e):
                     already = True
-                    job.log("上游镜像与本地一致（%s:%s），无需重新下载" % (iname, new_tag),
-                            level="warn")
+                    job.log("爱快表示 %s:%s 已在本地、拒绝重新下载（它只按记录在不在判断，"
+                            "不比对内容）" % (iname, new_tag), level="warn")
                 else:
                     raise
             job.step("pull", "done",
@@ -442,29 +488,67 @@ class JobManager(object):
             # 于是被判成「已在用 latest」→ 静默跳过更新，用户点了「切到 latest」
             # 什么也没发生，任务结果还报成功。这是 v1.4.2 的真实事故。
             # `cur_tag` 来自容器声明的镜像名，没写 tag 时 `split_image` 返回 latest，
-            # 与爱快前端的口径一致。
-            using_it = (cur_tag == new_tag)
+            # 与爱快前端的口径一致。（`using_it` 已在上面算好。）
 
-            # 镜像与上游一致**且容器已在用它** → 才谈得上是「已是最新」，不必重启
+            # 镜像与上游一致**且容器已在用它** → 才谈得上是「已是最新」，不必重启。
+            #
+            # ⚠️ 但「爱快回『已存在相同内容』」**不能**当成「内容一致」：它只检查
+            # 同名同 tag 的本地记录在不在，压根不比对内容。旧代码就这么把「拒绝
+            # 重新拉取」误判成「已是最新」，于是 latest 容器一旦落后就永远刷不新，
+            # 任务还报成功（mihomo / vaultwarden 线上事故）。这里必须再核一次内容。
             if already and using_it:
-                job.step("download", "skipped", "无需下载")
-                job.step("update", "skipped", "已是最新，跳过重启")
+                _stale, upstream, _up_cfg, upstream_src = stale_of(new_tag)
+                if _stale is False:
+                    job.step("download", "skipped", "无需下载")
+                    job.step("update", "skipped", "内容一致，跳过重启")
+                    job.step("verify", "skipped", "容器保持原状")
+                    self._remember_if_known(digest_key, upstream, upstream_src)
+                    cur = {x["name"]: x for x in A.get_containers(ik)}.get(c["name"]) or {}
+                    job.log("✅ %s 已是最新（本地镜像 == 上游内容指纹），未做任何改动"
+                            "（当前：%s）" % (c["name"], cur.get("status") or "运行中"))
+                    continue
+                if _stale is None:
+                    # 拿不到上游内容指纹，就只剩爱快那句话可依。别把它说成
+                    # 「已是最新」—— 说清楚依据是什么，用户才知道能不能信。
+                    job.step("download", "skipped", "无需下载")
+                    job.step("update", "skipped", "无法核对内容，按爱快判断跳过")
+                    job.step("verify", "skipped", "容器保持原状")
+                    self._remember_if_known(digest_key, upstream, upstream_src)
+                    job.log("⚠ %s 爱快表示 %s:%s 已在本地、拒绝重新拉取，但没取到上游内容"
+                            "指纹，无法确认内容是否真的最新。想强制刷新可用「指定版本」"
+                            "填一个新的 tag。" % (c["name"], iname, new_tag), level="warn")
+                    continue
+                # _stale is True：本地那份确实是旧的，而爱快拒绝重拉 → 只能「搬运」。
+                if new_tag == "latest":
+                    _ok, _msg = self._hoist_latest(job, ik, ctx, c, insp, repo, ns, iname,
+                                                   new_tag, _up_cfg, upstream_src, pull_t)
+                    if _ok:
+                        self._remember_if_known(digest_key, upstream, upstream_src)
+                    else:
+                        failures.append(c["name"])
+                    continue
+                job.step("download", "failed", "爱快拒绝重新拉取")
+                job.step("update", "failed", "内容落后且无法重新拉取")
                 job.step("verify", "skipped", "容器保持原状")
                 self._remember_if_known(digest_key, upstream, upstream_src)
-                cur = {x["name"]: x for x in A.get_containers(ik)}.get(c["name"]) or {}
-                job.log("✅ %s 已是最新版本，未做任何改动（当前：%s）"
-                        % (c["name"], cur.get("status") or "运行中"))
+                job.log("❌ %s 本地 %s:%s 的内容是旧的，但爱快认为同 tag 的记录已存在、"
+                        "拒绝重新拉取 —— 同名同 tag 的镜像内容无法原地刷新。\n"
+                        "   请到爱快后台「Docker → 本地镜像」删掉 %s 这条记录后重试；"
+                        "或改用「指定版本」换一个 tag。"
+                        % (c["name"], iname, new_tag, iname), level="error")
+                failures.append(c["name"])
                 continue
 
             # 「切换 tag」但切换原地打转：容器的镜像记录上**同时挂着当前 tag 和目标 tag**
             # （实测 vaultwarden 的条目就是 `"1.37.3,latest"` —— 容器声明跑 1.37.3，
             # 这条记录另外还挂着 latest）。这时把容器改成 repo:latest，落到的是
-            # **同一条记录、同一份内容**，容器不会真的变新；而爱快又只按
-            # 「同名同 tag 的本地记录是否已存在」拒拉、**不比对内容**（已存在相同内容），
-            # 于是新内容永远进不来。
+            # **同一条记录、同一份内容**；爱快又只按「同名同 tag 的记录是否已存在」
+            # 拒拉、**不比对内容**，于是新内容永远进不来。
             #
-            # 必须如实报「切换失败」——曾经这里报的是「✅ 已是最新版本」，
-            # 用户点了「切到 latest」什么都没发生、任务还显示成功，这是 v1.4.2 的真实事故。
+            # 这里要分两种情况，不能一刀切报失败（v1.4.2 的教训是「什么都报失败」，
+            # 反过来「什么都报成功」同样是假话）：
+            #   · 记录里的内容**已经等于上游** → 只是换个标签，重启切过去就是对的；
+            #   · 内容确实是旧的 → 走「搬运」（拉同内容的版本号 tag 再拐回来）。
             #
             # 注意与「镜像早已下好、只是容器没挂上去」区分开：那种情况目标 tag 是
             # **另一条独立记录**（owner 的 tag 串里没有 new_tag），重启是真能切过去的，
@@ -472,23 +556,37 @@ class JobManager(object):
             if already and not using_it:
                 own_tag = (A.image_owner(ik, c["name"]) or {}).get("tag") or ""
                 if A.tag_matches(own_tag, cur_tag) and A.tag_matches(own_tag, new_tag):
-                    job.step("download", "skipped", "爱快拒绝重新拉取")
-                    job.step("update", "failed", "未能切到 %s" % new_tag)
-                    job.step("verify", "skipped", "容器保持原状")
-                    self._remember_if_known(digest_key, upstream, upstream_src)
-                    job.log(
-                        "❌ %s 没能切到 %s：它在爱快上的镜像记录（%s）已经同时挂着 "
-                        "%s 和 %s 两个标签，且是**同一份内容** —— 改成 %s:%s 只是换个"
-                        "标签，容器不会真的变新。而爱快认为「%s」本地已存在、拒绝重新"
-                        "拉取（已存在相同内容），新内容也就永远进不来。\n"
-                        "   这不是 idocker 能绕过的：请到爱快后台「Docker → 本地镜像」"
-                        "里删掉 %s 这条记录（顺带把旧容器也清掉）后重试；"
-                        "或者改成更新到具体版本号 tag。"
-                        % (c["name"], new_tag, own_tag, cur_tag, new_tag, iname,
-                           new_tag, iname, iname),
-                        level="error")
-                    failures.append(c["name"])
-                    continue
+                    _stale2, upstream, _up_cfg2, upstream_src = stale_of(new_tag)
+                    if _stale2 is False:
+                        job.log("ℹ %s 这条镜像记录（%s）本来就含 %s，而且内容已是最新 ——"
+                                " 只需把容器切过去，不必重新下载"
+                                % (iname, own_tag, new_tag))
+                    elif _stale2 is True and new_tag == "latest":
+                        _ok, _msg = self._hoist_latest(job, ik, ctx, c, insp, repo, ns,
+                                                       iname, new_tag, _up_cfg2,
+                                                       upstream_src, pull_t)
+                        if _ok:
+                            self._remember_if_known(digest_key, upstream, upstream_src)
+                        else:
+                            failures.append(c["name"])
+                        continue
+                    else:
+                        job.step("download", "skipped", "爱快拒绝重新拉取")
+                        job.step("update", "failed", "未能切到 %s" % new_tag)
+                        job.step("verify", "skipped", "容器保持原状")
+                        self._remember_if_known(digest_key, upstream, upstream_src)
+                        job.log(
+                            "❌ %s 没能切到 %s：它在爱快上的镜像记录（%s）已经同时挂着 "
+                            "%s 和 %s 两个标签，且是**同一份内容** —— 改成 %s:%s 只是换个"
+                            "标签，容器不会真的变新。而爱快认为「%s」本地已存在、拒绝重新"
+                            "拉取（已存在相同内容），新内容也就永远进不来。\n"
+                            "   请到爱快后台「Docker → 本地镜像」里删掉 %s 这条记录后重试；"
+                            "或者改成更新到具体版本号 tag。"
+                            % (c["name"], new_tag, own_tag, cur_tag, new_tag, iname,
+                               new_tag, iname, iname),
+                            level="error")
+                        failures.append(c["name"])
+                        continue
 
             if already:
                 job.log("镜像 %s:%s 已在本地，但容器当前挂在 %s 上 → 跳过下载，直接重启切过去"
@@ -500,7 +598,6 @@ class JobManager(object):
                 job.step("download", "done", "镜像已在本地，跳过等待")
             else:
                 job.step("download", "running", "等待镜像落地")
-                pull_t = int(cfg.get("pull_timeout") or 900)
                 job.log("等待镜像下载完成（最长 %ds）…" % pull_t)
                 done, note = A.wait_for_image(ik, A.repo_of(c["image"]), new_tag, since,
                                               pull_t, ctx)
@@ -612,6 +709,195 @@ class JobManager(object):
                            % (len(plans), len(failures), "、".join(failures)))
         return True, "完成 %d 个容器的更新" % len(plans)
 
+    # -- 搬运：把 latest 落后的内容弄进本地 ---------------------------------
+    def _wait_running(self, ik, name, want_tag, tries=8, gap=2):
+        """等容器起来并确认它真的挂在 ``want_tag`` 上，返回 ``(ok, 说明)``。
+
+        只看 state=running 是不够的：爱快的 update 是异步的，容器自身的 image
+        字段常常不带 tag，重建了却仍跑旧镜像的情况实测出现过（lucky）。
+        """
+        after, owner = None, None
+        for _ in range(tries):
+            time.sleep(gap)
+            after = {x["name"]: x for x in A.get_containers(ik)}.get(name)
+            if after and after.get("state") == "running":
+                break
+        if not after:
+            return False, "更新后查不到容器"
+        if after.get("state") != "running":
+            return False, "容器状态异常（%s）" % (after.get("status") or "未知")
+        for _ in range(4):
+            owner = A.image_owner(ik, name)
+            if owner and A.tag_matches(owner.get("tag"), want_tag):
+                return True, after.get("status") or "running"
+            time.sleep(2)
+        ok_image = A.tag_matches(A.split_image(after.get("image") or "")[2], want_tag)
+        if ok_image:
+            return True, after.get("status") or "running"
+        return False, "仍挂在 %s 上，没切到 %s" % (
+            (owner or {}).get("tag") or "未知", want_tag)
+
+    def _hoist_latest(self, job, ik, ctx, c, insp, repo, ns, iname, new_tag,
+                      target_cfg, upstream_src, pull_t):
+        """爱快拒绝重拉 latest 时，绕道把最新内容搬进本地。
+
+        爱快判断「要不要下载」只看**同名同 tag 的本地记录在不在**，不比对内容：
+        只要 ``repo:latest`` 这条记录还在，install 就一律回「已存在相同内容」，
+        哪怕它是半年前的镜像。于是 latest 容器一旦落后就再也刷不新。
+
+        可行路径（每一步都在真机上验证过）：
+          1. 在上游 tag 列表里找一个**内容等于 latest 内容**的纯版本号 tag，拉它；
+          2. 把容器切到这个版本号 tag（内容已经是最新的，服务不降级）；
+          3. 删掉旧的 ``repo:latest`` 记录（此时已无容器占用它）；
+          4. 重新 install latest —— 同名记录不在，爱快这才真的下载；
+          5. 把容器切回 latest。
+
+        任何一步失败就停下并如实报告。最坏结果是容器停在那个版本号 tag 上 ——
+        内容一样新，只是不再「跟随 latest」，服务不受影响。
+
+        返回 ``(ok, message)``。
+        """
+        name = c["name"]
+        job.log("⚠ %s 本地 %s:%s 的内容落后于上游，而爱快拒绝重新拉取"
+                "（它只按「同名同 tag 的记录在不在」判断，不比对内容）"
+                % (name, iname, new_tag), level="warn")
+        job.log("   → 改为「搬运」：拉一个内容相同的版本号 tag，把容器切过去、删掉旧的 "
+                "%s 记录，再重新拉 %s 并切回来" % (new_tag, new_tag))
+
+        # 1. 找同内容的版本号 tag
+        job.step("download", "running", "寻找内容相同的版本号 tag")
+        try:
+            regs = A.resolve_registries(ik, self.cfg, job.log)
+            vt, vreg = A.find_version_tag(regs, repo, target_cfg, ctx,
+                                          self.cfg["timeout"], skip=(new_tag,))
+        except Exception as e:                              # noqa: BLE001
+            vt, vreg = "", ""
+            job.log("查询上游 tag 列表失败：%s" % e, level="warn")
+        if not vt:
+            job.step("download", "failed", "上游没有内容相同的版本号 tag")
+            job.step("update", "skipped", "未改动容器")
+            job.step("verify", "skipped", "容器保持原状")
+            job.log("❌ 找不到与 %s 内容相同的版本号 tag（上游可能只推 latest，"
+                    "也可能加速源不提供 tag 列表），没法搬运。\n"
+                    "   请到爱快后台「Docker → 本地镜像」删掉 %s 这条记录后重试；"
+                    "或者用「指定版本」填一个明确的版本号 tag。"
+                    % (new_tag, iname), level="error")
+            return False, "找不到可用的版本号 tag"
+        job.log("✓ 找到 %s:%s，内容与 %s:%s 相同（命中 %s），开始搬运"
+                % (repo, vt, repo, new_tag, vreg or upstream_src or "上游"))
+
+        # 2. 拉这个版本号 tag（它是独立记录，爱快会真的下载）
+        job.step("download", "running", "拉取 %s:%s" % (iname, vt))
+        since = int(time.time())
+        try:
+            ik.call("docker_image", "install",
+                    {"name": iname, "tag": vt, "image_logo": c.get("image_logo", ""),
+                     "namespace": ns})
+        except A.IKuaiError as e:
+            if not A.is_already_exists(e):
+                job.step("download", "failed", "拉取 %s:%s 失败" % (iname, vt))
+                job.step("update", "skipped", "未改动容器")
+                job.step("verify", "skipped", "容器保持原状")
+                job.log("❌ 拉取 %s:%s 失败：%s" % (iname, vt, e), level="error")
+                return False, "拉取版本号 tag 失败"
+        done, note = A.wait_for_image(ik, repo, vt, since, pull_t, ctx)
+        if not done:
+            msg = note if isinstance(note, str) else "超时"
+            job.step("download", "failed", "搬运用的 %s 未就绪" % vt)
+            job.step("update", "skipped", "未改动容器")
+            job.step("verify", "skipped", "容器保持原状")
+            job.log("❌ %s:%s 未在 %ds 内落地（%s）。容器没动，仍是原来的 %s。"
+                    % (iname, vt, pull_t, msg or "超时", new_tag), level="error")
+            job.log("   若镜像较大或加速源慢，可在「设置」里把下载超时调大后重试。",
+                    level="warn")
+            return False, "搬运用的镜像没下载完"
+        sig_vt = A.image_signature(ik, repo, vt)
+        if A.norm_digest(sig_vt) and not A.same_content(sig_vt, target_cfg):
+            job.log("⚠ %s:%s 落地后的内容指纹（%s）与上游 %s 对不上，可能源缓存滞后；"
+                    "继续搬运，最后会再核一次" % (iname, vt, A.norm_digest(sig_vt)[:12],
+                                                new_tag), level="warn")
+        job.step("download", "done", "已备好 %s:%s" % (iname, vt))
+
+        # 3. 容器临时切到版本号 tag
+        job.step("update", "running", "临时切到 %s:%s" % (iname, vt))
+        p_vt, _ = A.container_payload(c, insp, tag=vt)
+        ik.call("docker_container", "update", p_vt)
+        ok_vt, why = self._wait_running(ik, name, vt)
+        if not ok_vt:
+            job.step("update", "failed", "没能临时切到 %s" % vt)
+            job.step("verify", "skipped", "容器可能停在 %s" % vt)
+            job.log("❌ 容器没能切到 %s:%s（%s）。请到爱快后台核对容器状态 —— "
+                    "搬运在第一步就停下了，latest 还没修好" % (iname, vt, why),
+                    level="error")
+            return False, why
+
+        # 4. 删掉旧的 latest 记录（此刻没有容器占用它）
+        job.log("容器已临时切到 %s:%s，现在删掉本地旧的 %s 记录" % (iname, vt, new_tag))
+        okd, detail = A.del_local_image(ik, repo, new_tag)
+        if not okd:
+            job.step("update", "failed", "删不掉旧的 %s 记录" % new_tag)
+            job.step("verify", "skipped", "容器停在 %s" % vt)
+            job.log("❌ %s。容器现在跑 %s:%s（内容已是最新，服务正常），但 latest 的"
+                    "旧记录还在，最新内容仍无法「跟随 latest」。\n"
+                    "   请到爱快后台「Docker → 本地镜像」手动删掉 %s 后重试。"
+                    % (detail, iname, vt, iname), level="error")
+            return False, "删除旧记录失败"
+
+        # 5. 重新拉 latest —— 同名记录已不在，这次会真的下载
+        job.step("download", "running", "重新拉取 %s:%s" % (iname, new_tag))
+        since2 = int(time.time())
+        try:
+            ik.call("docker_image", "install",
+                    {"name": iname, "tag": new_tag, "image_logo": c.get("image_logo", ""),
+                     "namespace": ns})
+        except A.IKuaiError as e:
+            if A.is_already_exists(e):
+                job.log("⚠ 爱快仍认为 %s 已存在（旧记录可能没删干净）" % new_tag,
+                        level="warn")
+            else:
+                job.step("download", "failed", "重新拉取失败")
+                job.step("verify", "skipped", "容器停在 %s" % vt)
+                job.log("❌ 重新拉取 %s:%s 失败：%s。容器现在跑 %s:%s，内容已是最新，"
+                        "服务正常；latest 的旧记录已删，请重试一次更新。"
+                        % (iname, new_tag, e, iname, vt), level="error")
+                return False, "重新拉取 latest 失败"
+        done2, note2 = A.wait_for_image(ik, repo, new_tag, since2, pull_t, ctx)
+        sig_lt = A.image_signature(ik, repo, new_tag)
+        if not done2:
+            job.step("download", "failed", "latest 未就绪")
+            job.step("verify", "skipped", "容器停在 %s" % vt)
+            job.log("❌ 重新拉取 %s:%s 未在 %ds 内落地（%s）。容器现在跑 %s:%s，"
+                    "内容已是最新，服务正常；latest 记录已重置，重跑一次更新即可跟上。"
+                    % (iname, new_tag, pull_t, note2 if isinstance(note2, str) else "超时",
+                       iname, vt), level="error")
+            return False, "重新拉取 latest 未完成"
+        if A.norm_digest(sig_lt) and not A.same_content(sig_lt, target_cfg):
+            job.log("⚠ 新落地的 %s 内容指纹（%s）仍与上游 %s 不一致，可能命中了缓存不"
+                    "同步的加速源" % (new_tag, A.norm_digest(sig_lt)[:12],
+                                    A.norm_digest(target_cfg)[:12]), level="warn")
+        job.step("download", "done", "%s:%s 已就绪" % (iname, new_tag))
+
+        # 6. 容器切回 latest
+        job.step("update", "running", "切回 %s:%s" % (iname, new_tag))
+        p_lt, _ = A.container_payload(c, insp, tag=new_tag)
+        ik.call("docker_container", "update", p_lt)
+        ok_lt, why_lt = self._wait_running(ik, name, new_tag)
+        if not ok_lt:
+            job.step("update", "failed", "没能切回 %s" % new_tag)
+            job.step("verify", "failed", why_lt)
+            job.log("❌ 容器没能切回 %s:%s（%s）。镜像已经是最新的了，容器目前挂在 "
+                    "%s:%s 上，请到爱快后台核对或再点一次更新。"
+                    % (iname, new_tag, why_lt, iname, vt), level="error")
+            return False, why_lt
+
+        job.step("update", "done", "已切回 %s:%s" % (iname, new_tag))
+        job.step("verify", "done", "搬运完成 · %s" % new_tag)
+        job.log("✅ 搬运完成：%s 现在跑 %s:%s，内容为上游最新（%s）；本地 %s 记录已重置。"
+                "搬运用的临时记录 %s:%s 保留着，可当回滚点，也可在爱快「本地镜像」里手动清掉。"
+                % (name, iname, new_tag, A.norm_digest(target_cfg)[:12],
+                   new_tag, iname, vt))
+        return True, "已搬运到最新内容"
+
     # -- 版本检测流程 ----------------------------------------------
     def _run_check(self, job, ctx):
         cfg = self.cfg
@@ -625,7 +911,7 @@ class JobManager(object):
         local = A.LocalImages(A.get_local_images(ik))
         job.step("read", "done", "%d 个容器 / %d 个镜像" % (len(cs), len(local)))
 
-        job.step("query", "running", "查询上游 digest")
+        job.step("query", "running", "查询上游内容指纹")
         # 用爱快自己配置的加速源去查，保证「检测的源」和「拉取的源」一致
         registries = A.resolve_registries(ik, cfg, job.log)
         job.log("查询上游用的加速源（来自爱快 Docker 服务设置）：%s" % "、".join(registries))
@@ -638,14 +924,22 @@ class JobManager(object):
             if key in seen:
                 continue
             seen.add(key)
-            local_ts, _src = local.pulled_at(local.find(repo, tag))
+            img = local.find(repo, tag)
+            local_ts, _src = local.pulled_at(img)
+            # 本地镜像是「哪一份内容」的唯一依据：爱快记录的镜像 ID 就是
+            # config blob 的 sha256，和上游 amd64 子清单里的 config.digest 同层。
+            local_sig = str((img or {}).get("id") or "")
             item = {"container": c["name"], "image": key, "local": local_ts or "—",
-                    "status": "unknown", "digest": "", "registry": "", "pinned": ""}
+                    "status": "unknown", "digest": "", "registry": "", "pinned": "",
+                    "local_id": A.norm_digest(local_sig)[:12],
+                    "upstream_id": "", "basis": ""}
             try:
-                digest, reg = A.remote_digest(registries, repo, tag, ctx, cfg["timeout"])
+                digest, up_cfg, reg = A.remote_platform_digest(
+                    registries, repo, tag, ctx, cfg["timeout"])
                 item["digest"], item["registry"] = digest[:19], reg
-                old = self._seen_digest(key)
-                item["status"] = "unknown" if old is None else ("newer" if old != digest else "latest")
+                item["upstream_id"] = A.norm_digest(up_cfg)[:12]
+                item["status"], item["basis"] = self._judge(
+                    local_sig, up_cfg, digest, key)
                 # 容器锁在具体版本号 tag 上时（如 vaultwarden/server:1.37.3），该 tag 的
                 # 上游内容是固定的，上面必然得出「latest」。但那不等于没有新版 ——
                 # 该仓库的 latest 可能早就走远了。额外查一次 latest 作对比，把
@@ -666,16 +960,29 @@ class JobManager(object):
                 # 「查到的是哪个源的什么结果」比只看到一句「检测完成」有用得多。
                 st = item["status"]
                 if st == "newer":
-                    job.log("⬆ %s 上游有新版本（命中 %s）" % (key, reg), level="warn")
+                    job.log("⬆ %s 上游有新版本（本地镜像 %s ≠ 上游 amd64 内容 %s，命中 %s）"
+                            % (key, item["local_id"] or "?", item["upstream_id"] or "?",
+                               reg), level="warn")
                 elif st == "latest":
-                    job.log("✓ %s 已是最新（命中 %s）" % (key, reg))
-                else:
-                    job.log("· %s 首次检测，已记下基准（命中 %s）" % (key, reg))
+                    job.log("✓ %s 已是最新（本地镜像 %s == 上游 amd64 内容，命中 %s）"
+                            % (key, item["local_id"], reg))
+                elif st == "unknown":
+                    if item["basis"] == "digest":
+                        job.log("· %s 取不到上游内容指纹，只能按清单 digest 记基准"
+                                "（命中 %s）" % (key, reg), level="warn")
+                    else:
+                        job.log("· %s 首次检测，已记下上游指纹 %s（命中 %s）"
+                                % (key, item["upstream_id"] or digest[:19], reg))
                 if item["pinned"] == "ahead":
                     job.log("⚑ %s 锁定在 %s，但 %s:latest 已更新"
                             "（可用行内「指定版本」填 latest 切回跟随）"
                             % (key, tag, repo), level="warn")
-                self._remember_digest(key, digest, reg)
+                # ⚠️ 只有「确认已是最新」才刷新基准。
+                # 旧代码这里无条件覆盖，于是「有新版本」只活一个检测周期 ——
+                # 下次检测拿新 digest 跟自己比当然相等，报告自我消化掉，
+                # 用户看到的就是「明明有新版本却说已是最新」（线上踩过）。
+                if st != "newer":
+                    self._remember_digest(key, digest, reg)
                 results.append(item)
             except Exception as e:
                 item["status"] = "failed"
@@ -703,7 +1010,10 @@ class JobManager(object):
         for r in results:
             items[r["image"]] = {"status": r["status"], "digest": r.get("digest", ""),
                                  "registry": r.get("registry", ""), "local": r.get("local", ""),
-                                 "pinned": r.get("pinned", "")}
+                                 "pinned": r.get("pinned", ""),
+                                 "local_id": r.get("local_id", ""),
+                                 "upstream_id": r.get("upstream_id", ""),
+                                 "basis": r.get("basis", "")}
         payload = {"checked_at": time.time(),
                    "at_str": time.strftime("%Y-%m-%d %H:%M:%S"),
                    "items": items}
@@ -725,6 +1035,25 @@ class JobManager(object):
                 return {"checked_at": 0, "at_str": "", "items": {}}
 
     # -- digest 记忆 -------------------------------------------------
+    def _judge(self, local_sig, up_cfg, upstream, key):
+        """判定「本地这份镜像 vs 上游」，返回 ``(status, basis)``。
+
+        ``basis`` 说明这个结论有多硬：
+
+        - ``sig``    —— 拿本地镜像 ID 和上游 amd64 子清单的 ``config.digest`` 直接
+          比。这是唯一可信的口径：爱快说「已存在相同内容」时压根没比对过内容，
+          拿它当判据就会「永远已是最新」（mihomo 线上事故）。
+        - ``digest`` —— 源没给清单正文、取不到 config digest，只好退回「上游清单
+          digest 有没有变」。能发现上游动过，但不能确认本地真的落后。
+        - ``first``  —— 首次检测、什么都没有，无从判断。
+        """
+        if A.norm_digest(local_sig) and A.norm_digest(up_cfg):
+            return ("latest" if A.same_content(local_sig, up_cfg) else "newer"), "sig"
+        old = self._seen_digest(key)
+        if old is None:
+            return "unknown", "first"
+        return ("newer" if old != upstream else "latest"), "digest"
+
     def _state_path(self):
         return os.path.join(self.data_dir, "state.json")
 

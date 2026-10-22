@@ -819,26 +819,45 @@
   function openTagModal(name, repo, tag) {
     state.target = { name: name, repo: repo, tag: tag, picked: "" };
     $("tagTitle").textContent = name + " · 选择版本";
+    $("tagManual").value = "";
+    $("tagHint").textContent = "";
     $("tagBody").innerHTML = '<div class="muted">正在查询 ' + esc(repo) + ' 的可用版本…</div>';
     $("tagModal").classList.remove("hidden");
     api("/api/tags?image=" + encodeURIComponent(repo)).then(function (j) {
       var tags = j.data || [];
-      if (!tags.length) { $("tagBody").innerHTML = '<div class="muted">没查到版本列表</div>'; return; }
+      var src = j.source || "";
+      if (!tags.length) {
+        $("tagBody").innerHTML = '<div class="muted">没查到版本列表 —— ' +
+          '可以在上面手填 tag，比如 latest 或具体的版本号。</div>';
+        $("tagHint").textContent = "列表没拿到，手填的 tag 会原样使用";
+        return;
+      }
+      $("tagHint").textContent = (src === "registry" ? "列表来自加速源（爱快自己没给出）"
+                                    : src === "ikuai" ? "列表来自爱快" : "") +
+        (src === "registry" || src === "ikuai" ? " · 共 " + tags.length + " 个" : "");
       $("tagBody").innerHTML = '<div class="muted" style="margin-bottom:10px">当前：<b>' +
-        esc(tag) + '</b> · 共 ' + tags.length + ' 个版本，点击选择</div><div class="tag-grid">' +
+        esc(tag) + '</b> · 点击选择</div><div class="tag-grid">' +
         tags.map(function (t) {
           return '<span class="tag-chip" data-tag="' + esc(t) + '">' + esc(t) + '</span>';
         }).join("") + '</div>';
       Array.prototype.forEach.call(document.querySelectorAll(".tag-chip"), function (c) {
         c.addEventListener("click", function () {
+          var on = c.classList.contains("on");
           Array.prototype.forEach.call(document.querySelectorAll(".tag-chip"),
             function (x) { x.classList.remove("on"); });
+          if (on) {                       // 再点一次取消选择
+            state.target.picked = "";
+            return;
+          }
           c.classList.add("on");
           state.target.picked = c.dataset.tag;
+          $("tagManual").value = "";      // 点选优先，清掉手填的
         });
       });
     }).catch(function (e) {
-      $("tagBody").innerHTML = '<div class="muted">查询失败：' + esc(e.message) + '</div>';
+      $("tagBody").innerHTML = '<div class="muted">查询失败：' + esc(e.message) +
+        ' —— 可以在上面手填 tag。</div>';
+      $("tagHint").textContent = "手填的 tag 会原样使用";
     });
   }
 
@@ -1265,8 +1284,14 @@
   $("btnTagConfirm").addEventListener("click", function () {
     var t = state.target;
     if (!t) return;
+    // 手填优先（列表里没有的 tag 只能靠它），其次点选，最后回落到原 tag
+    var manual = ($("tagManual").value || "").trim();
+    var tag = manual || t.picked || t.tag;
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(tag)) {
+      toast("tag 只能是字母、数字、点、下划线、横线", "warn", 5000);
+      return;
+    }
     $("tagModal").classList.add("hidden");
-    var tag = t.picked || t.tag;
     if (state.busy || state.source) { toast("已有任务在执行，等它跑完再说", "warn"); return; }
     confirmUpdate([t.name], tag).then(function (yes) {
       if (yes) runUpdate([t.name], tag);

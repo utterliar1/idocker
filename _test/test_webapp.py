@@ -145,6 +145,11 @@ ok("启用后重新排期", d["data"]["schedules"][0]["enabled"] is True
 print("\n=== 4. 手动「立即执行」自动更新任务 ===")
 mock_router.FAKE.update_calls = []
 mock_router.FAKE.install_calls = []
+# 让上游内容真的比本地新一份（本地 clash 记录是 OLD_ID，上游是 NEW_ID）。
+# 不设的话 mock 会把本地镜像 ID 当上游内容，就成了「本来就没有新版」。
+mock_router.FAKE.configs["dreamacro/clash:latest"] = mock_router.NEW_ID
+# 定时任务先比对上游内容，命中「内容变了」才拉取 + 重启
+mock_router.FAKE.images[0]["id"] = mock_router.OLD_ID
 d, _ = req("/api/schedules", {"action": "run", "id": sc_upd["id"]})
 ok("返回 job_id", bool(d["data"].get("job_id")))
 job = wait_job(d["data"]["job_id"])
@@ -846,7 +851,7 @@ _vw30 = [c for c in mock_router.FAKE.containers if c["name"] == "vaultwarden"][0
 ok("切到 latest 后容器 image 变成 repo:latest",
    _vw30["image"] == "vaultwarden/server:latest", _vw30["image"])
 
-print("\n=== 33. 切换 tag「原地打转」：必须如实报失败，不能报「已是最新」===")
+print("\n=== 33. 「切到 latest」：内容一样就切标签，内容落后就搬运 ===")
 # 真实事故（2026-10-16 线上）：用户点「切到 latest」把 vaultwarden 切回跟随 latest，
 # 结果什么都没发生、任务还只报了另一个容器的失败。
 #
@@ -858,16 +863,21 @@ print("\n=== 33. 切换 tag「原地打转」：必须如实报失败，不能�
 #   2) 爱快对「同名同 tag 的本地记录已存在」一律回「已存在相同内容」、拒绝重新拉取，
 #      **不比对内容**，所以那个 latest 标签上的旧内容永远刷不新。
 #
-# 正确行为：如实报失败，并给出可操作的下一步（去爱快「本地镜像」删掉这条记录）。
-# 对照（必须继续走重启、不能误报失败）见上面第 15 段：目标 tag 是**另一条独立
-# 记录**时（owner 的 tag 串里没有 new_tag），重启是真能切过去的。
+# 现在的行为要分两种情况（一刀切报失败、一刀切报成功，都是假话）：
+#   · 记录里的内容**已经等于上游** → 本来就是换个标签，重启切过去就该成功；
+#   · 内容确实是旧的 → 走「搬运」（第 35 段）。
+# 这里先把状态摆成「只有一条 1.37.3,latest 记录、内容已是最新」。
 for _c33 in mock_router.FAKE.containers:
     if _c33["name"] == "vaultwarden":
         _c33["image"] = "vaultwarden/server:1.37.3"
+mock_router.FAKE.images = [
+    i for i in mock_router.FAKE.images
+    if i["name"] != "vaultwarden/server" or "1.37.3" in str(i.get("tag") or "")]
 for _i33 in mock_router.FAKE.images:
-    # 显式还原成「一条记录挂两个标签」，不依赖前序副作用
     if _i33["name"] == "vaultwarden/server":
         _i33["tag"] = "1.37.3,latest"
+        _i33["id"] = "sha256:" + "2" * 64
+mock_router.FAKE.configs.pop("vaultwarden/server:latest", None)
 mock_router.FAKE.update_calls = []
 mock_router.FAKE.install_existing_error = True
 try:
@@ -879,21 +889,201 @@ _st33 = step_states(_job33)
 _log33 = " ".join(x.get("message") or ""
                   for x in _jobs_mod.JobManager._extract_logs(
                       server.MANAGER.jobs[_j33.id]))
-
-ok("多标签记录不会被当成「容器已在使用 latest」而跳过", _st33["update"] != "skipped", _st33)
-ok("改为如实报失败", _st33["update"] == "failed", _st33)
-ok("不去用旧镜像重建容器（否则只是换个标签、内容没变）",
-   len(mock_router.FAKE.update_calls) == 0, mock_router.FAKE.update_calls)
 _vw33 = [c for c in mock_router.FAKE.containers if c["name"] == "vaultwarden"][0]
-ok("容器保持原状，仍挂在 1.37.3 上",
-   _vw33["image"] == "vaultwarden/server:1.37.3", _vw33["image"])
-ok("任务整体如实判失败（不再伪装成功）", _job33["ok"] is False, _job33.get("message"))
-ok("日志不含「已是最新版本」这种假成功措辞",
-   "已是最新版本" not in _log33, _log33[-220:])
-ok("明说了原因是「已存在相同内容 / 拒绝重新拉取」",
-   ("已存在相同内容" in _log33 or "拒绝重新拉取" in _log33), _log33[-220:])
+
+ok("多标签记录不会被当成「容器已在使用 latest」而静默跳过", _st33["update"] != "skipped", _st33)
+ok("内容已是最新时，只换标签就该真的切过去（重启一次）",
+   len(mock_router.FAKE.update_calls) == 1, mock_router.FAKE.update_calls)
+ok("容器 image 变成 repo:latest", _vw33["image"] == "vaultwarden/server:latest",
+   _vw33["image"])
+ok("任务如实判成功", _job33["ok"] is True, _job33.get("message"))
+ok("日志说明了「记录本来就含 latest，只是把容器切过去」",
+   "本来就含" in _log33, _log33[-260:])
+
+print("\n=== 33b. 同一个 tag 的内容真的落后：必须如实报失败 ===")
+# 反向对照：本地这份 `clash:2.0.0` 是旧内容，上游同 tag 换了新内容，爱快又拒绝重拉。
+# 同 tag 无法原地刷新，此时**不能**假装成功，也不能白重启一次容器。
+_clash33 = [c for c in mock_router.FAKE.containers if c["name"] == "clash"][0]
+_clash33["image"] = "dreamacro/clash:2.0.0"
+_clash_img = [i for i in mock_router.FAKE.images
+              if i["name"] == "dreamacro/clash" and "2.0.0" in str(i.get("tag") or "")][0]
+_clash_img["id"] = mock_router.OLD_ID
+mock_router.FAKE.configs["dreamacro/clash:2.0.0"] = mock_router.MID_ID
+mock_router.FAKE.update_calls = []
+mock_router.FAKE.install_existing_error = True
+try:
+    _j33b = server.MANAGER.create("update", ["clash"], "2.0.0", auto=False)
+    _job33b = wait_job(_j33b.id)
+finally:
+    mock_router.FAKE.install_existing_error = False
+_st33b = step_states(_job33b)
+_log33b = " ".join(x.get("message") or ""
+                   for x in _jobs_mod.JobManager._extract_logs(
+                       server.MANAGER.jobs[_j33b.id]))
+ok("同 tag 内容落后时如实报失败", _st33b["update"] == "failed", _st33b)
+ok("不去用旧镜像重建容器", len(mock_router.FAKE.update_calls) == 0,
+   mock_router.FAKE.update_calls)
+ok("任务整体判失败", _job33b["ok"] is False, _job33b.get("message"))
+ok("明说了「同 tag 的记录已存在、拒绝重新拉取」",
+   "拒绝重新拉取" in _log33b, _log33b[-260:])
 ok("给出了可操作的下一步（去爱快「本地镜像」删记录）",
-   "本地镜像" in _log33, _log33[-220:])
+   "本地镜像" in _log33b, _log33b[-260:])
+ok("没有把「拒绝拉取」说成「已是最新」",
+   "已是最新" not in _log33b, _log33b[-260:])
+# 还原，免得影响后面
+mock_router.FAKE.configs.pop("dreamacro/clash:2.0.0", None)
+_clash_img["id"] = mock_router.NEW_ID
+_clash33["image"] = "dreamacro/clash:latest"
+
+print("\n=== 34. 检测基准不再「自我消化」：本地内容没变，就一直报有新版本 ===")
+# 线上事故的根：旧代码比的是「上游 digest vs 自己上次记的 digest」，而且每次检测
+# 都无条件刷新基准 —— 上游一变，第一次报「有新版本」，第二次拿新 digest 跟自己比
+# 当然相等，报告自我消化，于是永远报「已是最新」（mihomo 报过一次后永久安静）。
+# 现在比的是「本地镜像 ID vs 上游 amd64 config.digest」。
+_clash34 = [c for c in mock_router.FAKE.containers if c["name"] == "clash"][0]
+_clash34["image"] = "dreamacro/clash:latest"
+_img34 = [i for i in mock_router.FAKE.images
+          if i["name"] == "dreamacro/clash" and "latest" in str(i.get("tag") or "")][0]
+_img34["id"] = mock_router.NEW_ID
+mock_router.FAKE.configs["dreamacro/clash:latest"] = mock_router.MID_ID
+
+
+def _check_now():
+    _j = server.MANAGER.create("check", [], None)
+    wait_job(_j.id)
+    _ev = [e for e in _j.events if e.get("type") == "check_result"]
+    _rs = (_ev[-1]["results"] if _ev else [])
+    return {r["image"]: r for r in _rs}
+
+
+_r1 = _check_now().get("dreamacro/clash:latest") or {}
+_r2 = _check_now().get("dreamacro/clash:latest") or {}
+ok("第一次检测报有新版本", _r1.get("status") == "newer", _r1)
+ok("第二次检测仍然报有新版本（基准不会被自己刷掉）",
+   _r2.get("status") == "newer", _r2)
+ok("判定依据是内容指纹（basis=sig）", _r2.get("basis") == "sig", _r2)
+ok("结论文档里带了本地/上游两个内容指纹",
+   _r2.get("local_id") == mock_router.NEW_ID[7:19]
+   and _r2.get("upstream_id") == mock_router.MID_ID[7:19], _r2)
+mock_router.FAKE.configs["dreamacro/clash:latest"] = mock_router.NEW_ID
+_r3 = _check_now().get("dreamacro/clash:latest") or {}
+ok("上游内容与本地一致时判为已是最新", _r3.get("status") == "latest", _r3)
+_r4 = _check_now().get("dreamacro/clash:latest") or {}
+ok("已是最新时也稳定（不会来回跳）", _r4.get("status") == "latest", _r4)
+ok("去掉容器锁定时 pinned 不误报", not _r4.get("pinned"), _r4)
+
+print("\n=== 35. latest 落后且爱快拒绝重拉：自动「搬运」到最新内容 ===")
+# 这是 mihomo 那类容器的死结：本地 latest 是旧内容，爱快只要看到同名同 tag 的
+# 记录在，就回「已存在相同内容」拒绝下载 —— 新内容永远进不来。
+# 搬运路径：拉一个内容相同的版本号 tag → 容器切过去 → 删旧 latest 记录 →
+#           重新拉 latest（这才会真下载）→ 容器切回 latest。
+_clash35 = [c for c in mock_router.FAKE.containers if c["name"] == "clash"][0]
+_clash35["image"] = "dreamacro/clash:latest"
+for _i35 in mock_router.FAKE.images:
+    if _i35["name"] == "dreamacro/clash" and "latest" in str(_i35.get("tag") or ""):
+        _i35["tag"] = "latest"
+        _i35["id"] = mock_router.OLD_ID
+        _i35["containers"] = [{"name": "clash", "state": "running"}]
+# 上游：latest 的内容是 NEW_ID，2.9.0 与它同一份内容，2.8.0 是旧的
+mock_router.FAKE.configs["dreamacro/clash:latest"] = mock_router.NEW_ID
+mock_router.FAKE.configs["dreamacro/clash:2.9.0"] = mock_router.NEW_ID
+mock_router.FAKE.configs["dreamacro/clash:2.8.0"] = mock_router.OLD_ID
+mock_router.FAKE.tags["dreamacro/clash"] = ["latest", "2.9.0", "2.8.0"]
+mock_router.FAKE.update_calls = []
+mock_router.FAKE.install_calls = []
+mock_router.FAKE.del_calls = []
+mock_router.FAKE.install_existing_error = True
+try:
+    _j35 = server.MANAGER.create("update", ["clash"], None, auto=False)
+    _job35 = wait_job(_j35.id)
+finally:
+    mock_router.FAKE.install_existing_error = False
+_st35 = step_states(_job35)
+_log35 = " ".join(x.get("message") or ""
+                  for x in _jobs_mod.JobManager._extract_logs(
+                      server.MANAGER.jobs[_j35.id]))
+_inst35 = list(mock_router.FAKE.install_calls)
+_lt35 = [i for i in mock_router.FAKE.images
+         if i["name"] == "dreamacro/clash" and i.get("tag") == "latest"]
+_clash35b = [c for c in mock_router.FAKE.containers if c["name"] == "clash"][0]
+
+ok("任务整体成功", _job35["ok"] is True, _job35.get("message"))
+ok("确实去拉了「内容相同的版本号 tag」", ("dreamacro/clash", "2.9.0") in _inst35, _inst35)
+ok("拉的是内容对得上的 2.9.0，不是旧的 2.8.0",
+   ("dreamacro/clash", "2.8.0") not in _inst35, _inst35)
+ok("容器先被切到版本号 tag 再切回 latest",
+   [x.get("image") for x in mock_router.FAKE.update_calls] ==
+   ["dreamacro/clash:2.9.0", "dreamacro/clash:latest"],
+   [x.get("image") for x in mock_router.FAKE.update_calls])
+ok("删除过旧的 latest 记录（并用完整 repo 名 + 真实 tag）",
+   any(d.get("name") == "dreamacro/clash" and d.get("tag") == "latest"
+       for d in mock_router.FAKE.del_calls), mock_router.FAKE.del_calls)
+ok("重新拉过一次 latest", sum(1 for x in _inst35
+                          if x == ("dreamacro/clash", "latest")) >= 2, _inst35)
+ok("最终 latest 记录的内容是上游最新那份",
+   len(_lt35) == 1 and _lt35[0]["id"] == mock_router.NEW_ID, _lt35)
+ok("容器最终仍跟随 latest", _clash35b["image"] == "dreamacro/clash:latest",
+   _clash35b["image"])
+_ow35 = A.image_owner(_ik, "clash")
+ok("占用关系落在 latest 记录上", bool(_ow35) and _ow35["tag"] == "latest", _ow35)
+ok("六步都走完了（没有 skipped 的假成功）",
+   all(_st35[k] == "done" for k in
+       ("login", "inspect", "pull", "download", "update", "verify")), _st35)
+ok("日志里说明了走的是「搬运」", "搬运" in _log35, _log35[-300:])
+# 让状态回到「已是最新」，不影响后面
+mock_router.FAKE.tags.pop("dreamacro/clash", None)
+mock_router.FAKE.configs.pop("dreamacro/clash:2.9.0", None)
+mock_router.FAKE.configs.pop("dreamacro/clash:2.8.0", None)
+mock_router.FAKE.images = [i for i in mock_router.FAKE.images
+                           if i["name"] != "dreamacro/clash" or i.get("tag") == "latest"]
+
+print("\n=== 36. 「指定版本」：爱快没给列表时退回加速源 + 支持手填 ===")
+# 实测 metacubex/mihomo 的 tag_list 恒为空 → 弹窗只有一句「没查到版本列表」，
+# 用户既选不了也填不了，只能干瞪眼。
+mock_router.FAKE.ikuai_tags = []
+mock_router.FAKE.tags["metacubex/mihomo"] = [
+    "latest", "1.19.33", "1.19.32", "v1.19.31", "alpha-git"]
+d, code = req("/api/tags?image=" + urllib.parse.quote("metacubex/mihomo"))
+_tags36 = d.get("data") or []
+ok("GET /api/tags 正常返回", code == 200 and d.get("ok"), code)
+ok("爱快给空时退回加速源读 tag 列表", d.get("source") == "registry", d.get("source"))
+ok("列表按版本号倒序（新的在前）",
+   _tags36[:3] == ["1.19.33", "1.19.32", "v1.19.31"], _tags36)
+ok("语义 tag 仍保留在列表里", "latest" in _tags36 and "alpha-git" in _tags36, _tags36)
+
+mock_router.FAKE.ikuai_tags = ["latest", "1.0"]
+d, _ = req("/api/tags?image=" + urllib.parse.quote("metacubex/mihomo"))
+ok("爱快有列表时优先用它并标明来源", d.get("source") == "ikuai", d.get("source"))
+mock_router.FAKE.ikuai_tags = ["latest", "1.7.2", "1.8.0"]
+mock_router.FAKE.tags.pop("metacubex/mihomo", None)
+
+_htm = open(os.path.join(APP, "static", "index.html"), encoding="utf-8").read()
+ok("弹窗里有手填 tag 的输入框", 'id="tagManual"' in _htm)
+_js = open(os.path.join(APP, "static", "app.js"), encoding="utf-8").read()
+ok("确认时手填优先于点选", "manual || t.picked || t.tag" in _js)
+ok("非法 tag 会被拦下（防手滑打出路径/空格）",
+   "[A-Za-z0-9][A-Za-z0-9._-]{0,127}" in _js)
+
+print("\n=== 37. 删除本地镜像记录：回读确认，不信 Success ===")
+# 爱快的 del 会静默成功（参数对不上也回 Success 却什么都不删），所以删完必须回读。
+mock_router.FAKE.images.append({
+    "name": "demo/app", "tag": "9.9.9", "id": mock_router.MID_ID,
+    "install": int(time.time()), "created": int(time.time()), "size": 1,
+    "namespace": "demo", "containers": []})
+mock_router.FAKE.del_calls = []
+_okd, _detail = A.del_local_image(_ik, "demo/app", "9.9.9")
+ok("删掉后回读确实不在清单里", _okd is True and not [
+    i for i in mock_router.FAKE.images if i["name"] == "demo/app"], _detail)
+ok("del 用的是完整 repo 名 + 真实 tag",
+   mock_router.FAKE.del_calls and mock_router.FAKE.del_calls[0].get("name") == "demo/app"
+   and mock_router.FAKE.del_calls[0].get("tag") == "9.9.9", mock_router.FAKE.del_calls)
+mock_router.FAKE.del_calls = []
+_okd2, _detail2 = A.del_local_image(_ik, "demo/app", "9.9.9")
+ok("记录本来就不存在时直接算成功", _okd2 is True and "已无" in _detail2, _detail2)
+ok("不存在时不会白发删除请求", not mock_router.FAKE.del_calls, mock_router.FAKE.del_calls)
+ok("内容指纹规范化（sha256: 前缀/大小写都能对上）",
+   A.same_content("sha256:" + "A" * 64, "a" * 64) and not A.same_content("", "a" * 64))
+ok("截断的短 ID 不算「完整指纹」（不敢下结论）", A.norm_digest("sha256:abc123") == "")
 
 # ---- 收尾：把还在跑的任务等完、把两个 HTTP 服务关掉再退出 ----
 # 否则守护线程会在解释器最终化时被硬杀，容易在退出阶段炸掉（CI 上实测 exit 139，

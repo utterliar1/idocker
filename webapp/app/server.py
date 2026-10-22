@@ -52,7 +52,7 @@ import jobs as J               # noqa: E402
 import scheduler as SC         # noqa: E402
 import store as S              # noqa: E402
 
-VERSION = "1.4.3"
+VERSION = "1.5.0"
 CFG = A.load_config()
 MANAGER = J.JobManager(CFG)
 # 持久化设置：页面里改的下载超时、定时任务都落在这里（Docker 卷 /data）
@@ -586,7 +586,18 @@ class Handler(BaseHTTPRequestHandler):
                 image = (query.get("image") or [""])[0]
                 if not image:
                     raise ApiError("缺少 image 参数")
-                return self._send_json({"ok": True, "data": with_client(lambda ik: A.get_tags(ik, image))})
+                # 爱快那个「可用版本」接口对某些仓库恒返回空（实测 metacubex/mihomo），
+                # 空了就退回加速源的 /tags/list —— 否则弹窗里只有一句「没查到版本列表」。
+                box = {"src": "none"}
+
+                def _tags(ik):
+                    tags, src = A.list_tags(ik, CFG, image)
+                    box["src"] = src
+                    return tags
+
+                tags = with_client(_tags)
+                return self._send_json({"ok": True, "data": tags,
+                                        "source": box.get("src") or "none"})
             if path == "/api/history":
                 return self._send_json({"ok": True,
                                         "data": [history_brief(h) for h in MANAGER.history]})

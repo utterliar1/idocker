@@ -396,6 +396,69 @@ def image_signature(ik, repo, tag):
     return str((img or {}).get("id") or "")
 
 
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def norm_digest(value):
+    """把各种写法的指纹统一成 64 位小写十六进制。
+
+    ``sha256:AB…`` / ``AB…`` / ``sha256:ab…`` → ``ab…``。
+    取不到、或不是完整的 sha256（例如被截断成 12 位短 ID）时返回空串 ——
+    「不知道」必须能和「不一样」区分开，否则会把截断 ID 当成内容不同，
+    每次检测都误报有新版本。
+    """
+    s = str(value or "").strip().lower()
+    if s.startswith("sha256:"):
+        s = s[len("sha256:"):]
+    return s if _HEX64.match(s) else ""
+
+
+def same_content(a, b):
+    """两处指纹是否指向同一份镜像内容。任一侧不完整就一律 False（不敢下结论）。"""
+    na, nb = norm_digest(a), norm_digest(b)
+    return bool(na) and na == nb
+
+
+def del_local_image(ik, repo, tag):
+    """删除一条本地镜像记录，并**回读确认真的删掉了**。
+
+    爱快的 ``docker_image.del`` 会静默失败：参数对不上时照样回
+    ``{"code":0,"message":"Success"}`` 而记录一动不动（实测）。
+    能对上号的写法是「**完整 repo 名** + **未截断的真实 tag**」，``name``/``namespace``
+    拆开传无效；``id`` 一般不参与匹配。所以这里既**不发 id 优先**，也**发 id 兜底** ——
+    最后一定回读清单确认，绝不把 Success 当成功。
+
+    返回 ``(ok, detail)``。
+    """
+    def matched():
+        out = []
+        for img in get_local_images(ik):
+            if img.get("name") != repo:
+                continue
+            if tag_matches(img.get("tag"), tag):
+                out.append(img)
+        return out
+
+    rows = matched()
+    if not rows:
+        return True, "本地已无 %s:%s 记录" % (repo, tag)
+    ids = [str(r.get("id") or "") for r in rows if r.get("id")]
+    shapes = [{"name": repo, "tag": tag}]
+    for i in ids:
+        shapes.append({"name": repo, "tag": tag, "id": i})
+    last = ""
+    for shape in shapes:
+        try:
+            last = json.dumps(ik.call("docker_image", "del", shape), ensure_ascii=False)
+        except Exception as e:                                   # noqa: BLE001
+            last = str(e)
+        if not matched():
+            return True, "已删除（参数 %s）" % json.dumps(shape, ensure_ascii=False)
+    left = len(matched())
+    return False, ("爱快回了 Success 但记录仍在（%d 条，试过 %d 种参数，末次返回 %s）"
+                   % (left, len(shapes), last[:160]))
+
+
 def image_owner(ik, container_name):
     """反查某容器**实际**挂在哪条镜像上。
 
@@ -536,30 +599,54 @@ def resolve_registries(ik, cfg, log=None):
     return fallback
 
 
+def _as_list(registries):
+    if isinstance(registries, str):
+        return [registries]
+    return list(registries or [])
+
+
+def _repo_path(image):
+    """'metacubex/mihomo' → 'metacubex/mihomo'；'busybox' → 'library/busybox'"""
+    image = image or ""
+    return image if "/" in image else "library/" + image
+
+
+def _registry_get(reg, repo, path, ctx=None, timeout=20, headers=None):
+    """带 Bearer 认证的 registry GET，返回 (body_bytes, headers_dict)。
+
+    401 时必须看 ``WWW-Authenticate``：真 registry 给的是
+    ``Bearer realm=…``；某些「看起来像加速源」的地址只回一个 HTML 错误页、
+    连这个头都没有 —— 那种源拉不动镜像，早点报错比后面卡死强。
+    """
+    url = "%s/v2/%s/%s" % (reg.rstrip("/"), repo, path)
+    h = dict(headers or {})
+    try:
+        resp = _fetch(url, h, timeout)
+    except urllib.error.HTTPError as e:
+        if e.code not in (401, 403):
+            raise IKuaiError("HTTP %s" % e.code)
+        www = e.headers.get("WWW-Authenticate", "") or ""
+        if not www.lower().startswith("bearer"):
+            raise IKuaiError("HTTP %s（不是标准 registry，缺少 Bearer 认证头）" % e.code)
+        h["Authorization"] = "Bearer " + _token(www, repo, timeout)
+        try:
+            resp = _fetch(url, h, timeout)
+        except urllib.error.HTTPError as e2:
+            raise IKuaiError("HTTP %s" % e2.code)
+    with resp:
+        return resp.read(), dict(resp.headers)
+
+
 def remote_digest(registries, image, tag, ctx=None, timeout=20):
     """多加速源依次回退，返回 (digest, 命中的加速源)"""
-    if isinstance(registries, str):
-        registries = [registries]
-    repo = image if "/" in image else "library/" + image
+    repo = _repo_path(image)
     errors = []
-    for reg in registries:
-        url = "%s/v2/%s/manifests/%s" % (reg.rstrip("/"), repo, tag)
-        headers = {"Accept": ACCEPT_MANIFEST}
+    for reg in _as_list(registries):
         try:
-            try:
-                resp = _fetch(url, headers, timeout)
-            except urllib.error.HTTPError as e:
-                if e.code in (401, 403):
-                    www = e.headers.get("WWW-Authenticate", "")
-                    if not www.lower().startswith("bearer"):
-                        raise IKuaiError("HTTP %s" % e.code)
-                    headers["Authorization"] = "Bearer " + _token(www, repo, timeout)
-                    resp = _fetch(url, headers, timeout)
-                else:
-                    raise IKuaiError("HTTP %s" % e.code)
-            with resp:
-                d = resp.headers.get("Docker-Content-Digest") or (
-                    "sha256:" + hashlib.sha256(resp.read()).hexdigest())
+            body, hd = _registry_get(reg, repo, "manifests/" + tag, ctx, timeout,
+                                     {"Accept": ACCEPT_MANIFEST})
+            d = hd.get("Docker-Content-Digest") or (
+                "sha256:" + hashlib.sha256(body).hexdigest())
             if ctx:
                 ctx.vlog("%s 命中 %s:%s" % (reg, repo, tag))
             return d, reg
@@ -567,7 +654,199 @@ def remote_digest(registries, image, tag, ctx=None, timeout=20):
             errors.append("%s → %s" % (reg, e))
             if ctx:
                 ctx.vlog("%s 失败：%s" % (reg, e))
-    raise IKuaiError("所有加速源都查不到 %s:%s" % (image, tag))
+    raise IKuaiError("所有加速源都查不到 %s:%s（%s）"
+                     % (image, tag, "；".join(errors) if errors else "无可用源"))
+
+
+def _config_digest_of(reg, repo, body, ctx, timeout, arch, os_name, depth=0):
+    """从 manifest 里取出「指定平台那份镜像」的 config digest。
+
+    为什么要绕这一圈：本地镜像 ID（``docker images`` 里那串）**等于 config blob 的
+    sha256**，而 manifest / index 的 digest 是另一层东西 —— 拿它们直接比，永远不
+    相等。多架构镜像更麻烦：index 的 digest 一变，可能只是 arm64 那份重新构建了，
+    amd64 的内容没动。所以必须下钻到 amd64 子清单里取 ``config.digest``，
+    才能和本地镜像 ID 做同层比较。
+    """
+    if depth > 2:
+        return ""
+    try:
+        obj = json.loads((body or b"").decode("utf-8"))
+    except Exception:                                            # noqa: BLE001
+        return ""
+    if not isinstance(obj, dict):
+        return ""
+    cfg = obj.get("config")
+    if isinstance(cfg, dict) and cfg.get("digest"):
+        return str(cfg["digest"])
+    subs = obj.get("manifests")
+    if not isinstance(subs, list) or not subs:
+        return ""
+    picked = ""
+    for m in subs:
+        if not isinstance(m, dict):
+            continue
+        p = m.get("platform") or {}
+        if str(p.get("architecture") or "") != arch or str(p.get("os") or "") != os_name:
+            continue
+        picked = str(m.get("digest") or "")
+        if not p.get("variant"):            # 同架构优先不带 variant（arm/v7 之类才带）
+            break
+    if not picked:
+        return ""
+    try:
+        sub_body, _hd = _registry_get(reg, repo, "manifests/" + picked, ctx, timeout,
+                                      {"Accept": ACCEPT_MANIFEST})
+    except Exception as e:                                       # noqa: BLE001
+        if ctx:
+            ctx.vlog("  子清单 %s 取不到：%s" % (picked[:19], e))
+        return ""
+    return _config_digest_of(reg, repo, sub_body, ctx, timeout, arch, os_name, depth + 1)
+
+
+def remote_platform_digest(registries, image, tag, ctx=None, timeout=20,
+                           arch="amd64", os_name="linux"):
+    """查上游，返回 (manifest_digest, config_digest, 命中的加速源)。
+
+    - ``manifest_digest``：tag 上那一层清单的 digest，用来判断「上游有没有动过」；
+    - ``config_digest``：**本机这台机器（amd64）那份镜像**的 config digest，
+      可以直接和本地镜像 ID 比对，判断「本地内容是不是最新」。
+
+    ``config_digest`` 取不到时返回空串（某些源只给 header 不给正文），
+    此时只能退回按 manifest digest 判断 —— 调用方要能区分这两种精度。
+    """
+    repo = _repo_path(image)
+    errors = []
+    for reg in _as_list(registries):
+        try:
+            body, hd = _registry_get(reg, repo, "manifests/" + tag, ctx, timeout,
+                                     {"Accept": ACCEPT_MANIFEST})
+            man = hd.get("Docker-Content-Digest") or (
+                "sha256:" + hashlib.sha256(body).hexdigest())
+            cfg = _config_digest_of(reg, repo, body, ctx, timeout, arch, os_name)
+            if ctx:
+                ctx.vlog("%s 命中 %s:%s（manifest %s / config %s）"
+                         % (reg, repo, tag, str(man)[:19], (cfg or "-")[:19]))
+            return man, cfg, reg
+        except Exception as e:                                   # noqa: BLE001
+            errors.append("%s → %s" % (reg, e))
+            if ctx:
+                ctx.vlog("%s 失败：%s" % (reg, e))
+    raise IKuaiError("所有加速源都查不到 %s:%s（%s）"
+                     % (image, tag, "；".join(errors) if errors else "无可用源"))
+
+
+_VERSION_SPLIT = re.compile(r"[._-]")
+
+
+def version_key(tag):
+    """版本号 tag 的排序键：'v1.19.33' → (1, 19, 33)，越大越新。
+
+    拿来做「最近的版本排前面」，不是拿来做语义判断 —— 能不能比大小仍由
+    ``is_version_tag`` 决定。
+    """
+    s = str(tag or "").strip().lstrip("vV")
+    parts = []
+    for p in _VERSION_SPLIT.split(s):
+        if not p.isdigit():
+            break
+        parts.append(int(p))
+    return tuple(parts or [0])
+
+
+def remote_tags(registries, image, ctx=None, timeout=20):
+    """直接从加速源读 tag 列表（``/v2/<repo>/tags/list``）。
+
+    爱快自己那个 ``docker_image.show {TYPE:"tag"}`` 有两个毛病（实测）：
+    对某些仓库**恒返回空列表**（metacubex/mihomo 就是），而且会落后一版。
+    所以「指定版本」下拉框不能只依赖它。
+    """
+    repo = _repo_path(image)
+    errors = []
+    for reg in _as_list(registries):
+        try:
+            body, _hd = _registry_get(reg, repo, "tags/list?n=200", ctx, timeout)
+            tags = json.loads(body.decode("utf-8")).get("tags") or []
+            tags = [str(t) for t in tags if str(t).strip()]
+            if tags:
+                return _sort_tags(tags), reg
+            errors.append("%s → 返回空列表" % reg)
+        except Exception as e:                                   # noqa: BLE001
+            errors.append("%s → %s" % (reg, e))
+    raise IKuaiError("所有加速源都读不到 %s 的 tag 列表（%s）"
+                     % (image, "；".join(errors) if errors else "无可用源"))
+
+
+def _sort_tags(tags):
+    """版本号倒序在前，其余（latest/ssh/slim 之类）按原顺序跟在后面。"""
+    seen, vers, others = set(), [], []
+    for t in tags or []:
+        t = str(t or "").strip()
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        (vers if is_version_tag(t) else others).append(t)
+    vers.sort(key=version_key, reverse=True)
+    return vers + others
+
+
+def list_tags(ik, cfg, image, log=None, timeout=20):
+    """「指定版本」下拉框的数据源，返回 ``(tags, source)``。
+
+    ``source``：``ikuai`` = 爱快自己的列表；``registry`` = 加速源直读；
+    ``none`` = 都没拿到。空列表就退回加速源，是因为爱快那个接口对部分仓库
+    恒返回空 —— 界面上表现为「没查到版本列表」，用户只能干瞪眼。
+    """
+    def say(msg, level="info"):
+        if log:
+            try:
+                log(msg, level=level)
+            except Exception:                                    # noqa: BLE001
+                pass
+
+    try:
+        tags = [str(t) for t in (get_tags(ik, image) or []) if str(t).strip()]
+    except Exception as e:                                       # noqa: BLE001
+        tags = []
+        say("读取爱快的版本列表失败（%s）" % e, "warn")
+    if tags:
+        return _sort_tags(tags), "ikuai"
+    try:
+        regs = resolve_registries(ik, cfg, log)
+        tags, reg = remote_tags(regs, image)
+        say("爱快没给出 %s 的版本列表，已从加速源 %s 直接读取 %d 个 tag"
+            % (image, reg, len(tags)))
+        return tags, "registry"
+    except Exception as e:                                       # noqa: BLE001
+        say("加速源也读不到 %s 的 tag 列表：%s" % (image, e), "warn")
+        return [], "none"
+
+
+def find_version_tag(registries, repo, target_cfg, ctx=None, timeout=20, limit=12,
+                     skip=()):
+    """在上游 tag 里找「内容 == target_cfg」的**纯版本号** tag，返回 ``(tag, reg)``。
+
+    这是「把 latest 落后的内容搬进来」的关键一步：爱快拒绝重拉 ``latest``，
+    但同一个内容通常还挂着一个版本号 tag（Docker Hub 上 latest 与最新版本号
+    往往指向同一份镜像）。拉那个版本号 tag 就能把内容拿到本地。
+
+    只看最近 ``limit`` 个版本号 tag —— 越老的越不可能等于 latest 的内容，
+    每个都要打一次清单请求，全查一遍太慢。
+    """
+    if not norm_digest(target_cfg):
+        return "", ""
+    try:
+        tags, reg0 = remote_tags(registries, repo, ctx, timeout)
+    except Exception:                                            # noqa: BLE001
+        return "", ""
+    cand = [t for t in tags if is_version_tag(t) and t not in set(skip or ())]
+    for tag in cand[:limit]:
+        try:
+            _man, cfg, reg = remote_platform_digest(registries, repo, tag, ctx, timeout)
+        except Exception:                                        # noqa: BLE001
+            continue
+        if cfg and norm_digest(cfg) == norm_digest(target_cfg):
+            return tag, reg
+    return "", ""
 
 
 def wait_for_image(ik, repo, tag, since, timeout, ctx):
