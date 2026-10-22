@@ -1085,6 +1085,78 @@ ok("内容指纹规范化（sha256: 前缀/大小写都能对上）",
    A.same_content("sha256:" + "A" * 64, "a" * 64) and not A.same_content("", "a" * 64))
 ok("截断的短 ID 不算「完整指纹」（不敢下结论）", A.norm_digest("sha256:abc123") == "")
 
+print("\n=== 38. 搬运重试：上一轮留下的「下载失败」残留不能把重试挡死 ===")
+# 真机实测踩到：上一轮搬运被中断，`v1.19.33` 留下一条 id=0 的失败残留记录
+# （task_queue 里 status=3 progress=10 长期不动）。再点更新时，爱快看到同名同 tag
+# 的记录还在，照样回「已存在相同内容」—— 于是重试永远原地踏步。
+# 正确做法：这条记录的内容明显对不上（id=0 / 内容不同）就先删掉再拉。
+_clash38 = [c for c in mock_router.FAKE.containers if c["name"] == "clash"][0]
+_clash38["image"] = "dreamacro/clash:latest"
+mock_router.FAKE.images = [
+    i for i in mock_router.FAKE.images if i["name"] != "dreamacro/clash"]
+mock_router.FAKE.images.append({
+    "name": "dreamacro/clash", "tag": "latest", "id": mock_router.OLD_ID,
+    "install": int(time.time()) - 86400, "created": int(time.time()) - 86400,
+    "size": 1, "namespace": "dreamacro",
+    "containers": [{"name": "clash", "state": "running"}]})
+# 上一轮失败留下的残留：id=0、没有容器在用
+mock_router.FAKE.images.append({
+    "name": "dreamacro/clash", "tag": "2.9.0", "id": "0",
+    "install": 0, "created": 0, "size": 0, "namespace": "dreamacro",
+    "containers": []})
+mock_router.FAKE.configs["dreamacro/clash:latest"] = mock_router.NEW_ID
+mock_router.FAKE.configs["dreamacro/clash:2.9.0"] = mock_router.NEW_ID
+mock_router.FAKE.tags["dreamacro/clash"] = ["latest", "2.9.0"]
+mock_router.FAKE.update_calls = []
+mock_router.FAKE.install_calls = []
+mock_router.FAKE.del_calls = []
+mock_router.FAKE.install_existing_error = True
+try:
+    _j38 = server.MANAGER.create("update", ["clash"], None, auto=False)
+    _job38 = wait_job(_j38.id)
+finally:
+    mock_router.FAKE.install_existing_error = False
+_st38 = step_states(_job38)
+_log38 = " ".join(x.get("message") or ""
+                  for x in _jobs_mod.JobManager._extract_logs(
+                      server.MANAGER.jobs[_j38.id]))
+_lt38 = [i for i in mock_router.FAKE.images
+         if i["name"] == "dreamacro/clash" and i.get("tag") == "latest"]
+
+ok("残留记录被识别出来（日志点明 id=0 / 内容对不上）",
+   "先删掉这条残留" in _log38, _log38[-320:])
+ok("确实先删了那条残留（不是直接 install 撞墙）",
+   any(d.get("tag") == "2.9.0" for d in mock_router.FAKE.del_calls),
+   mock_router.FAKE.del_calls)
+ok("删完重新拉成功、搬运走完", _job38["ok"] is True, _job38.get("message"))
+ok("最终 latest 记录是上游最新内容",
+   len(_lt38) == 1 and _lt38[0]["id"] == mock_router.NEW_ID, _lt38)
+ok("容器仍跟随 latest",
+   [c for c in mock_router.FAKE.containers if c["name"] == "clash"][0]["image"]
+   == "dreamacro/clash:latest")
+ok("六步全 done", all(_st38[k] == "done" for k in
+                      ("login", "inspect", "pull", "download", "update", "verify")), _st38)
+mock_router.FAKE.tags.pop("dreamacro/clash", None)
+mock_router.FAKE.configs.pop("dreamacro/clash:2.9.0", None)
+
+print("\n=== 39. 精确查 vs 带回退的查：别把同仓库另一条记录当成目标 ===")
+# `LocalImages.find()` 有「同仓库只有一条记录就按仓库认领」的回退，那是给
+# 「容器在跑什么镜像」用的。判断「这条 tag 的记录在不在」必须精确查，
+# 否则会把 latest 那条记录当成 v1.19.33 的内容，进而误判内容一致、甚至删错记录。
+mock_router.FAKE.images = [i for i in mock_router.FAKE.images
+                           if i["name"] != "onlyrepo/app"]
+mock_router.FAKE.images.append({
+    "name": "onlyrepo/app", "tag": "latest", "id": mock_router.NEW_ID,
+    "install": int(time.time()), "created": int(time.time()), "size": 1,
+    "namespace": "onlyrepo", "containers": []})
+ok("同仓库唯一记录时，带回退的查会认领它",
+   (A.LocalImages(mock_router.FAKE.images).find("onlyrepo/app", "9.9.9") or {}).get("id")
+   == mock_router.NEW_ID)
+ok("精确查不会认领（目标 tag 确实不存在）",
+   A.exact_image(_ik, "onlyrepo/app", "9.9.9") is None)
+ok("精确查能查到真实存在的那条",
+   (A.exact_image(_ik, "onlyrepo/app", "latest") or {}).get("id") == mock_router.NEW_ID)
+
 # ---- 收尾：把还在跑的任务等完、把两个 HTTP 服务关掉再退出 ----
 # 否则守护线程会在解释器最终化时被硬杀，容易在退出阶段炸掉（CI 上实测 exit 139，
 # 而 131 项断言其实全过了 —— 问题出在收尾，不是测试本身）。

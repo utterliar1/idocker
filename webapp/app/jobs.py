@@ -356,8 +356,12 @@ class JobManager(object):
             return _regs["v"]
 
         def local_sig(tag):
-            """本地 repo:tag 记录的镜像 ID —— 和上游 config.digest 同层可比。"""
-            return A.image_signature(ik, repo, tag)
+            """本地 repo:tag 记录的镜像 ID —— 和上游 config.digest 同层可比。
+
+            用**精确**查（`exact_image`），不走「同仓库唯一就认领」的回退：
+            否则目标 tag 还没拉过时，会把仓库里另一条记录的内容当成它的内容。
+            """
+            return str((A.exact_image(ik, repo, tag) or {}).get("id") or "")
 
         def upstream_of(tag):
             """查上游，返回 (manifest digest, amd64 config digest, 命中的源)。"""
@@ -788,6 +792,24 @@ class JobManager(object):
 
         # 2. 拉这个版本号 tag（它是独立记录，爱快会真的下载）
         job.step("download", "running", "拉取 %s:%s" % (iname, vt))
+        # 本地可能已经有这条记录：上一轮搬运失败留下的「下载失败」残留（id 为 0 / 内容对不上），
+        # 或者是内容不同的一份旧镜像。两者都会让爱快回「已存在相同内容」而拒拉，
+        # 于是重试永远原地踏步（真机实测踩到：上一轮被中断 → 残留 id=0 → 再拉被拒）。
+        # 先清掉这条对不上的记录，再拉。
+        _cur_vt = str((A.exact_image(ik, repo, vt) or {}).get("id") or "")
+        if _cur_vt and not A.same_content(_cur_vt, target_cfg):
+            job.log("本地已有 %s:%s 的记录，但内容对不上（%s）—— 先删掉这条残留再重新拉"
+                    % (iname, vt, A.norm_digest(_cur_vt)[:12] or "无内容(id=0)"),
+                    level="warn")
+            _okd, _detail = A.del_local_image(ik, repo, vt)
+            if not _okd:
+                job.step("download", "failed", "清不掉 %s 的旧记录" % vt)
+                job.step("update", "skipped", "未改动容器")
+                job.step("verify", "skipped", "容器保持原状")
+                job.log("❌ %s。搬运要用的 %s:%s 记录清不掉，没法重新拉取。\n"
+                        "   请到爱快后台「Docker → 本地镜像」手动删掉它后重试。"
+                        % (_detail, iname, vt), level="error")
+                return False, "清不掉搬运用的旧记录"
         since = int(time.time())
         try:
             ik.call("docker_image", "install",

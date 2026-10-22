@@ -459,6 +459,19 @@ def del_local_image(ik, repo, tag):
                    % (left, len(shapes), last[:160]))
 
 
+def exact_image(ik, repo, tag):
+    """按 ``repo:tag`` **精确**查一条本地记录，没查到就返回 ``None``。
+
+    不能直接用 ``LocalImages.find()``：它带「同仓库只有一条记录就按仓库认领」的回退，
+    那是为「容器在跑哪个镜像」准备的；而这里要回答的是「**这条 tag** 的记录在不在」，
+    一旦回退就会把别的 tag 的记录认成目标 —— 真机上足以导致误判、甚至删错记录。
+    """
+    for img in get_local_images(ik):
+        if img.get("name") == repo and tag_matches(img.get("tag"), tag):
+            return img
+    return None
+
+
 def image_owner(ik, container_name):
     """反查某容器**实际**挂在哪条镜像上。
 
