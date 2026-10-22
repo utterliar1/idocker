@@ -442,6 +442,21 @@ def del_local_image(ik, repo, tag):
     rows = matched()
     if not rows:
         return True, "本地已无 %s:%s 记录" % (repo, tag)
+    # 🔴 安全阀：还有容器挂着的记录**一律不删**。
+    # 2026-10-22 真机事故：搬运途中并发删了「正被切过去」的镜像记录，爱快删容器后
+    # 没能重建，容器直接消失（clash 就是这么没的）。宁可报错让人工处理，
+    # 也不能在工具里留下「删一条记录顺带删掉一个容器」的可能。
+    busy = []
+    for r in rows:
+        cs = r.get("containers")
+        if isinstance(cs, dict):
+            cs = list(cs.values())
+        for c in (cs or []):
+            if isinstance(c, dict) and c.get("name"):
+                busy.append(str(c["name"]))
+    if busy:
+        return False, ("记录仍被容器占用（%s），拒绝删除 —— 先让容器切到别的 tag 再来"
+                       % "、".join(sorted(set(busy))))
     ids = [str(r.get("id") or "") for r in rows if r.get("id")]
     shapes = [{"name": repo, "tag": tag}]
     for i in ids:

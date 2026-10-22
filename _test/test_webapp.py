@@ -1085,6 +1085,21 @@ ok("内容指纹规范化（sha256: 前缀/大小写都能对上）",
    A.same_content("sha256:" + "A" * 64, "a" * 64) and not A.same_content("", "a" * 64))
 ok("截断的短 ID 不算「完整指纹」（不敢下结论）", A.norm_digest("sha256:abc123") == "")
 
+# 🔴 安全阀：被容器占用的记录绝不删
+# 2026-10-22 真机事故：搬运途中并发删掉「正被切过去」的镜像记录，爱快删了容器却没
+# 重建，容器直接消失（clash 就这么没的）。工具层面必须堵死这条路。
+mock_router.FAKE.images.append({
+    "name": "demo/busy", "tag": "latest", "id": mock_router.NEW_ID,
+    "install": int(time.time()), "created": int(time.time()), "size": 1,
+    "namespace": "demo", "containers": [{"name": "ghost", "state": "running"}]})
+mock_router.FAKE.del_calls = []
+_okb, _db = A.del_local_image(_ik, "demo/busy", "latest")
+ok("记录还被容器占用时拒绝删除", _okb is False and "占用" in _db, _db)
+ok("拒绝时一个删除请求都不发（连试探都不试）",
+   not mock_router.FAKE.del_calls, mock_router.FAKE.del_calls)
+ok("记录原样还在", any(i["name"] == "demo/busy" for i in mock_router.FAKE.images))
+mock_router.FAKE.images = [i for i in mock_router.FAKE.images if i["name"] != "demo/busy"]
+
 print("\n=== 38. 搬运重试：上一轮留下的「下载失败」残留不能把重试挡死 ===")
 # 真机实测踩到：上一轮搬运被中断，`v1.19.33` 留下一条 id=0 的失败残留记录
 # （task_queue 里 status=3 progress=10 长期不动）。再点更新时，爱快看到同名同 tag
