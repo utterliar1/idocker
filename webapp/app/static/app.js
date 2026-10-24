@@ -20,8 +20,9 @@
     inited: false,
     progress: { current: 0, total: 0 },
     target: null,        // 当前正在选版本的容器
-    settings: {},        // 下载超时 + 定时任务
+    settings: {},        // 下载超时 + 定时任务 + 通知
     setInited: false,
+    setNotify: "fail",   // 设置弹窗里选的通知时机（off / fail / always）
     scEdit: null,        // 正在编辑的定时任务（null = 新建）
     scMode: "check",
     scFreq: "every",
@@ -1111,7 +1112,25 @@
         return { v: v, label: fmtDuration(v) };
       }),
       function (v) { $("setTimeout").value = v; });
+    // 通知时机：页面设置优先，没在页面上设过就是后端按环境变量给的默认值
+    state.setNotify = s.notify_mode || "fail";
+    setSeg("setNotify", "data-notify", state.setNotify);
+    renderNotifyHint(s);
     $("setModal").classList.remove("hidden");
+  }
+
+  function renderNotifyHint(s) {
+    var el = $("setNotifyHint");
+    if (!el) return;
+    var ch = (s && s.notify_channels) || [];
+    if (ch.length) {
+      el.innerHTML = "已配置：" + ch.map(function (c) { return esc(c.label); }).join(" · ") +
+        "<br>定时任务凌晨跑完或挂掉都会推一条，不用一直开着页面看。";
+    } else {
+      el.innerHTML = "尚未配置通知渠道：在 compose 的 .env 里填 " +
+        "<span class=\"mono\">NOTIFY_WEBHOOK_URL</span>（通用 webhook）或 " +
+        "<span class=\"mono\">NOTIFY_PUSHPLUS_TOKEN</span>（微信），重启容器后生效。";
+    }
   }
 
   function renderQuick(box, items, onPick) {
@@ -1125,7 +1144,8 @@
 
   function saveSettings() {
     var v = parseInt($("setTimeout").value, 10);
-    api("/api/settings", { method: "POST", body: { pull_timeout: v } })
+    api("/api/settings", { method: "POST",
+                           body: { pull_timeout: v, notify_mode: state.setNotify } })
       .then(function (j) {
         applySettings(j.data);
         state.setInited = false;
@@ -1338,6 +1358,7 @@
     syncTargetHint();
   });
   bindSeg("scMode", function (el) { state.scMode = el.getAttribute("data-mode"); });
+  bindSeg("setNotify", function (el) { state.setNotify = el.getAttribute("data-notify"); });
   bindSeg("scFreq", function (el) {
     state.scFreq = el.getAttribute("data-freq");
     syncFreqVisibility();

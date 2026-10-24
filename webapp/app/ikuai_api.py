@@ -639,6 +639,95 @@ def _repo_path(image):
     return image if "/" in image else "library/" + image
 
 
+# --------------------------------------------------------------------
+# 加速源健康记忆
+# --------------------------------------------------------------------
+# 为什么要记：一个源坏掉（TLS 握不上手、403、连不上）时，回退链上**每个镜像**
+# 都要陪它等满一次超时。实测线上：7 个镜像 × 一个 20 秒握不上手的源 = 检测
+# 118 秒，其中 104 秒（88%）全是白等，而打开页面就会自动跑一次检测。
+#
+# 做法：失败过的源在冷却期内排到队尾，健康源先试 —— 于是坏源在第一个镜像之后
+# 就再也不会被碰到。冷却结束自动复活，不写死黑名单，源修好了不用改配置。
+SOURCE_COOLDOWN = 600          # 失败后多少秒内排到队尾（秒）
+
+_source_health = {}            # key -> {"fails", "until", "reason", "ok_at"}
+_source_lock = threading.Lock()
+
+
+def _source_key(reg):
+    return str(reg or "").strip().rstrip("/").lower()
+
+
+def mark_source_ok(reg):
+    """这个源刚成功过一次 —— 立刻解除冷却。"""
+    key = _source_key(reg)
+    if not key:
+        return
+    with _source_lock:
+        st = _source_health.setdefault(key, {})
+        st["fails"] = 0
+        st["until"] = 0.0
+        st["reason"] = ""
+        st["ok_at"] = time.time()
+
+
+def mark_source_bad(reg, reason):
+    """记一次失败并进入冷却。
+
+    ``HTTP 404`` 不算：那是「这个源没有这个镜像」，源本身是健康的，换别的镜像
+    它照样能用 —— 把它冷却掉反而会让后面的镜像少一条回退路径。
+    """
+    text = str(reason or "")
+    if "HTTP 404" in text:
+        return
+    key = _source_key(reg)
+    if not key:
+        return
+    now = time.time()
+    with _source_lock:
+        st = _source_health.setdefault(key, {"fails": 0, "until": 0.0,
+                                             "reason": "", "ok_at": 0.0})
+        st["fails"] = int(st.get("fails") or 0) + 1
+        st["reason"] = text[:160]
+        st["until"] = now + SOURCE_COOLDOWN
+
+
+def source_cooling(reg, now=None):
+    """这个源此刻是否处于冷却期。"""
+    key = _source_key(reg)
+    now = time.time() if now is None else now
+    with _source_lock:
+        st = _source_health.get(key) or {}
+        return float(st.get("until") or 0) > now
+
+
+def order_sources(registries):
+    """健康源在前、冷却中的源在后（**不删除** —— 全坏了还得靠它们兜底）。
+
+    顺序就是回退顺序，所以把坏源排到最后，等于让它在下一次请求里就被健康源
+    抢先命中，不用再等它一次超时。
+    """
+    regs = _as_list(registries)
+    now = time.time()
+    good, cooling = [], []
+    for r in regs:
+        (cooling if source_cooling(r, now) else good).append(r)
+    return good + cooling
+
+
+def source_health():
+    """排查用：当前各源的冷却状态（不含任何凭据）。"""
+    now = time.time()
+    with _source_lock:
+        return {k: {"fails": v.get("fails") or 0,
+                    "cooling": float(v.get("until") or 0) > now,
+                    "left": max(0, int(float(v.get("until") or 0) - now)),
+                    "reason": v.get("reason") or "",
+                    "ok_at": v.get("ok_at") or 0}
+                for k, v in _source_health.items()}
+
+
+
 def _registry_get(reg, repo, path, ctx=None, timeout=20, headers=None):
     """带 Bearer 认证的 registry GET，返回 (body_bytes, headers_dict)。
 
@@ -669,16 +758,18 @@ def remote_digest(registries, image, tag, ctx=None, timeout=20):
     """多加速源依次回退，返回 (digest, 命中的加速源)"""
     repo = _repo_path(image)
     errors = []
-    for reg in _as_list(registries):
+    for reg in order_sources(registries):
         try:
             body, hd = _registry_get(reg, repo, "manifests/" + tag, ctx, timeout,
                                      {"Accept": ACCEPT_MANIFEST})
             d = hd.get("Docker-Content-Digest") or (
                 "sha256:" + hashlib.sha256(body).hexdigest())
+            mark_source_ok(reg)
             if ctx:
                 ctx.vlog("%s 命中 %s:%s" % (reg, repo, tag))
             return d, reg
         except Exception as e:
+            mark_source_bad(reg, e)
             errors.append("%s → %s" % (reg, e))
             if ctx:
                 ctx.vlog("%s 失败：%s" % (reg, e))
@@ -744,18 +835,20 @@ def remote_platform_digest(registries, image, tag, ctx=None, timeout=20,
     """
     repo = _repo_path(image)
     errors = []
-    for reg in _as_list(registries):
+    for reg in order_sources(registries):
         try:
             body, hd = _registry_get(reg, repo, "manifests/" + tag, ctx, timeout,
                                      {"Accept": ACCEPT_MANIFEST})
             man = hd.get("Docker-Content-Digest") or (
                 "sha256:" + hashlib.sha256(body).hexdigest())
             cfg = _config_digest_of(reg, repo, body, ctx, timeout, arch, os_name)
+            mark_source_ok(reg)
             if ctx:
                 ctx.vlog("%s 命中 %s:%s（manifest %s / config %s）"
                          % (reg, repo, tag, str(man)[:19], (cfg or "-")[:19]))
             return man, cfg, reg
         except Exception as e:                                   # noqa: BLE001
+            mark_source_bad(reg, e)
             errors.append("%s → %s" % (reg, e))
             if ctx:
                 ctx.vlog("%s 失败：%s" % (reg, e))
@@ -790,15 +883,17 @@ def remote_tags(registries, image, ctx=None, timeout=20):
     """
     repo = _repo_path(image)
     errors = []
-    for reg in _as_list(registries):
+    for reg in order_sources(registries):
         try:
             body, _hd = _registry_get(reg, repo, "tags/list?n=200", ctx, timeout)
             tags = json.loads(body.decode("utf-8")).get("tags") or []
             tags = [str(t) for t in tags if str(t).strip()]
             if tags:
+                mark_source_ok(reg)
                 return _sort_tags(tags), reg
             errors.append("%s → 返回空列表" % reg)
         except Exception as e:                                   # noqa: BLE001
+            mark_source_bad(reg, e)
             errors.append("%s → %s" % (reg, e))
     raise IKuaiError("所有加速源都读不到 %s 的 tag 列表（%s）"
                      % (image, "；".join(errors) if errors else "无可用源"))

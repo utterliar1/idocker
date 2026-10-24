@@ -25,7 +25,7 @@ services:
     # 想跳过本地构建、直接用 CI 产出的官方镜像，就注释掉上面的 build:，
     # 并把下面这行换成：
     #   image: ghcr.io/utterliar1/idocker:latest
-    image: idocker:1.5.2
+    image: idocker:1.5.3
     container_name: idocker
     restart: unless-stopped
 
@@ -56,6 +56,14 @@ services:
       # 仅作兜底：上游版本检测优先用「爱快 Docker 服务设置里配的加速源」，
       # 读不到（或爱快没配）时才用这里。想换源就该去爱快后台改，而不是改这里。
       REGISTRIES: "${REGISTRIES:-https://docker.1ms.run,https://hub.rat.dev,https://docker.m.daocloud.io}"
+
+      # ---------- 可选：任务结束通知（定时任务跑挂了不用开页面才知道）----------
+      # 填了哪个就用哪个；都不填 = 不通知。页面上只能选「什么时候发」，
+      # 渠道本身只从环境变量读（URL 里常带密钥，不下发到浏览器）。
+      NOTIFY_WEBHOOK_URL: "${NOTIFY_WEBHOOK_URL:-}"
+      NOTIFY_WEBHOOK_TOKEN: "${NOTIFY_WEBHOOK_TOKEN:-}"
+      NOTIFY_PUSHPLUS_TOKEN: "${NOTIFY_PUSHPLUS_TOKEN:-}"
+      NOTIFY_ON: "${NOTIFY_ON:-fail}"                # off / fail / always
 
     volumes:
       # 存放状态与执行历史；用命名卷可避免飞牛上的目录权限问题

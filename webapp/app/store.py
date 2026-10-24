@@ -39,6 +39,9 @@ SUGGESTED_TIMEOUTS = [600, 1800, 3600]
 
 SCHEDULE_MODES = ("check", "update")     # 仅检测 / 自动更新
 MAX_SCHEDULES = 30
+# 通知时机：关闭 / 仅失败 / 每次都发。权威定义在 notify.py，这里复制一份是为了
+# 让 store 不必反过来依赖 notify（server 会把两边对齐）。
+NOTIFY_MODES = ("off", "fail", "always")
 
 _TIME_RE = re.compile(r"^(\d{1,2}):(\d{1,2})$")
 
@@ -95,11 +98,15 @@ def describe_frequency(item):
 
 
 class Store(object):
-    def __init__(self, path, default_timeout=DEFAULT_PULL_TIMEOUT):
+    def __init__(self, path, default_timeout=DEFAULT_PULL_TIMEOUT,
+                 default_notify_mode="fail"):
         self.path = path
         # 页面上没设置过时用环境变量给的默认值 —— 否则用户明明在 compose 里
         # 写了 PULL_TIMEOUT，却会被这里的硬编码默认值悄悄盖掉。
         self.default_timeout = clamp_timeout(default_timeout)
+        self.default_notify_mode = (default_notify_mode
+                                    if default_notify_mode in NOTIFY_MODES
+                                    else "fail")
         self._lock = threading.RLock()
         try:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -119,6 +126,9 @@ class Store(object):
             raw = {}
         data = {
             "pull_timeout": clamp_timeout(raw.get("pull_timeout"), self.default_timeout),
+            # 空串 = 没在页面上设置过，跟着环境变量 NOTIFY_ON 走
+            "notify_mode": (str(raw.get("notify_mode") or "")
+                            if str(raw.get("notify_mode") or "") in NOTIFY_MODES else ""),
             "schedules": [],
         }
         for it in raw.get("schedules") or []:
@@ -179,6 +189,21 @@ class Store(object):
             self.data["pull_timeout"] = clamp_timeout(value)
             self._save()
             return self.data["pull_timeout"]
+
+    # -- 通知 ------------------------------------------------------
+    def get_notify_mode(self):
+        with self._lock:
+            mode = str(self.data.get("notify_mode") or "")
+            return mode if mode in NOTIFY_MODES else self.default_notify_mode
+
+    def set_notify_mode(self, value):
+        mode = str(value or "").strip().lower()
+        if mode not in NOTIFY_MODES:
+            raise ValueError("通知时机只能是 %s" % "、".join(NOTIFY_MODES))
+        with self._lock:
+            self.data["notify_mode"] = mode
+            self._save()
+            return mode
 
     # -- 定时任务 --------------------------------------------------
     def schedules(self):
@@ -294,5 +319,9 @@ class Store(object):
                 "pull_timeout_min": MIN_PULL_TIMEOUT,
                 "pull_timeout_max": MAX_PULL_TIMEOUT,
                 "suggested_timeouts": SUGGESTED_TIMEOUTS,
+                "notify_mode": (str(self.data.get("notify_mode") or "")
+                                if str(self.data.get("notify_mode") or "") in NOTIFY_MODES
+                                else self.default_notify_mode),
+                "notify_modes": list(NOTIFY_MODES),
                 "schedules": items,
             }

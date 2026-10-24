@@ -217,6 +217,16 @@
         <b>超时不会破坏任何东西</b> —— 只会跳过这个容器，
         绝不用旧镜像去重建它，其他容器照常处理。
       </div>
+
+      <div class="form-row">
+        <label>任务结束后通知</label>
+        <div class="seg" id="setNotify">
+          <button type="button" class="seg-item" data-notify="off">关闭</button>
+          <button type="button" class="seg-item" data-notify="fail">仅失败时</button>
+          <button type="button" class="seg-item" data-notify="always">每次都发</button>
+        </div>
+        <div class="hint-box" id="setNotifyHint"></div>
+      </div>
     </div>
     <div class="modal-foot">
       <span class="muted" id="setFoot"></span>

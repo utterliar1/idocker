@@ -49,19 +49,37 @@ STATIC_DIR = os.path.join(HERE, "static")
 sys.path.insert(0, HERE)
 import ikuai_api as A          # noqa: E402
 import jobs as J               # noqa: E402
+import notify as N             # noqa: E402
 import scheduler as SC         # noqa: E402
 import store as S              # noqa: E402
 
-VERSION = "1.5.2"
+VERSION = "1.5.3"
 CFG = A.load_config()
 MANAGER = J.JobManager(CFG)
-# 持久化设置：页面里改的下载超时、定时任务都落在这里（Docker 卷 /data）
+# 持久化设置：页面里改的下载超时、定时任务、通知时机都落在这里（Docker 卷 /data）
 STORE = S.Store(os.path.join(CFG.get("data_dir") or "/data", "settings.json"),
-                default_timeout=CFG.get("pull_timeout"))
+                default_timeout=CFG.get("pull_timeout"),
+                default_notify_mode=N.default_mode())
 # 页面上的设置优先级高于环境变量，这样不改容器就能调参数
 CFG["pull_timeout"] = STORE.get_pull_timeout()
 SCHEDULER = SC.Scheduler(STORE, MANAGER)
-MANAGER.set_on_finish(SCHEDULER.on_job_finish)
+
+
+def _on_job_finish(job):
+    """任务收尾：先回写定时任务结果，再发通知。
+
+    通知是异步的（见 notify.notify_job），webhook 那头慢或挂掉都不会拖住这里。
+    """
+    try:
+        SCHEDULER.on_job_finish(job)
+    finally:
+        try:
+            N.notify_job(job, STORE, VERSION)
+        except Exception as e:                              # noqa: BLE001
+            sys.stderr.write("[idocker] 通知发送失败：%s\n" % e)
+
+
+MANAGER.set_on_finish(_on_job_finish)
 
 MIME = {
     ".html": "text/html; charset=utf-8",
@@ -666,6 +684,11 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/settings":
                 if body.get("pull_timeout") is not None:
                     CFG["pull_timeout"] = STORE.set_pull_timeout(body.get("pull_timeout"))
+                if body.get("notify_mode") is not None:
+                    try:
+                        STORE.set_notify_mode(body.get("notify_mode"))
+                    except ValueError as e:
+                        raise ApiError(str(e))
                 return self._send_json({"ok": True, "data": self._schedules_view()})
             if path == "/api/schedules":
                 return self._send_json({"ok": True, "data": self._schedule_action(body)})
@@ -680,6 +703,9 @@ class Handler(BaseHTTPRequestHandler):
         data = STORE.public()
         data["busy"] = MANAGER.is_busy()
         data["server_time"] = time.time()
+        # 通知渠道只给「配了哪些」，完整 URL / token 一律不下发（里面常带密钥）
+        data["notify_channels"] = N.channels()
+        data["notify_configured"] = bool(data["notify_channels"])
         return data
 
     def _schedule_action(self, body):
@@ -769,7 +795,12 @@ class Handler(BaseHTTPRequestHandler):
                     "server": srv, "mirrors": mirrors}
         data = with_client(work)
         data["config"] = self._public_config()
-        data["history"] = MANAGER.history[:10]
+        # 必须走 history_brief：前端 renderHistory 用 log_count 判断「日志」按钮能不能点。
+        # 早期这里直接塞 MANAGER.history[:10] 原始记录，没有 log_count，于是每次
+        # 首屏 / 自动刷新之后历史列表里的日志按钮全是灰的，非要点一次「刷新」
+        # 走 /api/history 才恢复。顺带把 10 条完整日志从 overview 里去掉 ——
+        # 实测 overview 59KB 里有 44KB 是历史日志，每 60 秒白传一遍。
+        data["history"] = [history_brief(h) for h in MANAGER.history[:10]]
         data["check"] = MANAGER.last_check()      # 上次检测结果，页面刷新后仍能显示上游状态
         data["settings"] = self._schedules_view()  # 下载超时 + 定时任务
         return data

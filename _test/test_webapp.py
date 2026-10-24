@@ -1420,6 +1420,165 @@ ok("日志说明「本地内容已与上游一致，无需下载」", "无需下
 ok("没有重启容器（内容没变、容器本来就在用）", not mock_router.FAKE.update_calls,
    mock_router.FAKE.update_calls)
 
+print("\n=== 42. 总览里的历史必须是摘要：有 log_count、不带日志正文 ===")
+d, _code = req("/api/overview")
+_ov42 = d["data"]
+_hist42 = _ov42.get("history") or []
+ok("总览带了历史记录", len(_hist42) > 0, len(_hist42))
+ok("每条都有 log_count（前端靠它决定「日志」按钮能不能点）",
+   all("log_count" in h for h in _hist42),
+   [sorted(h.keys()) for h in _hist42[:2]])
+ok("每条都不带日志正文",
+   all("logs" not in h for h in _hist42), [sorted(h.keys()) for h in _hist42[:2]])
+ok("log_count 是真数（不是恒 0）", any((h.get("log_count") or 0) > 0 for h in _hist42),
+   [h.get("log_count") for h in _hist42[:5]])
+# 老实现把 10 条完整日志塞进总览，实测占 75% 的体积；这里量一下别回退：
+# 拿同一条记录的「摘要」和「含日志的详情」比，摘要必须明显更小。
+_hist_bytes = len(json.dumps(_hist42, ensure_ascii=False).encode("utf-8"))
+ok("历史摘要体积很小（10 条 < 20KB）", _hist_bytes < 20480, _hist_bytes)
+_full42, _c42 = req("/api/history/" + _hist42[0]["id"])
+ok("详情接口仍能拿到日志正文", _c42 == 200 and (_full42["data"].get("logs") is not None))
+_brief_one = len(json.dumps(_hist42[0], ensure_ascii=False).encode("utf-8"))
+_full_one = len(json.dumps(_full42["data"], ensure_ascii=False).encode("utf-8"))
+ok("单条摘要远小于含日志的详情", _brief_one < _full_one, (_brief_one, _full_one))
+
+print("\n=== 43. 加速源健康：坏源排到队尾，404 不算坏源 ===")
+_A43 = server.A
+_A43._source_health.clear()
+_GOOD, _BAD = "https://good.example", "https://bad.example"
+ok("一开始按原顺序回退", _A43.order_sources([_BAD, _GOOD]) == [_BAD, _GOOD])
+_A43.mark_source_bad(_BAD, "HTTP 403（不是标准 registry，缺少 Bearer 认证头）")
+ok("失败过的源排到队尾（不删除，仍可兜底）",
+   _A43.order_sources([_BAD, _GOOD]) == [_GOOD, _BAD], _A43.order_sources([_BAD, _GOOD]))
+ok("冷却状态可查", _A43.source_cooling(_BAD) is True)
+ok("没失败过的源不受影响", _A43.source_cooling(_GOOD) is False)
+_A43.mark_source_bad("https://missing.example", "HTTP 404")
+ok("404 不算坏源（那是「这个源没这个镜像」）",
+   _A43.source_cooling("https://missing.example") is False)
+_A43.mark_source_ok(_BAD)
+ok("成功一次立即解除冷却",
+   _A43.source_cooling(_BAD) is False
+   and _A43.order_sources([_BAD, _GOOD]) == [_BAD, _GOOD])
+
+# 端到端：把爱快加速源配成「先一个连不上的、再真桩」，检测必须照样成功，
+# 并把坏源记进冷却（下一次检测就不用再陪它等）。
+_DEAD = "http://127.0.0.1:1"
+mock_router.FAKE.mirrors = [_DEAD, "http://127.0.0.1:%d" % PORT]
+_d43, _ = req("/api/check", {})
+_job43 = wait_job(_d43["job_id"])
+ok("有坏源时检测仍然成功（回退到好源）", _job43["ok"] is True, _job43.get("message"))
+_ov43, _ = req("/api/overview")
+_items43 = ((_ov43["data"].get("check") or {}).get("items") or {})
+ok("坏源被记进冷却，下一轮直接排到队尾", _A43.source_cooling(_DEAD) is True)
+ok("没有镜像被判查询失败",
+   bool(_items43) and all(v.get("status") != "failed" for v in _items43.values()),
+   {k: v.get("status") for k, v in _items43.items()})
+mock_router.FAKE.mirrors = ["http://127.0.0.1:%d" % PORT]
+
+print("\n=== 44. 任务结束通知：渠道、时机、不泄漏 URL ===")
+_N44 = server.N
+
+
+class _Recv(object):
+    """最小的 webhook 接收端，记下收到的每个请求。"""
+    def __init__(self):
+        import http.server as _hs
+        outer = self
+        self.got = []
+
+        class H(_hs.BaseHTTPRequestHandler):
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(n).decode("utf-8")
+                try:
+                    body = json.loads(raw or "{}")
+                except ValueError:
+                    body = {"_raw": raw}
+                outer.got.append({"path": self.path, "body": body,
+                                  "token": self.headers.get("X-Notify-Token")})
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *a):                       # noqa: A003
+                pass
+
+        self.httpd = _hs.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.url = "http://127.0.0.1:%d/hook?token=SECRET-XYZ" % self.httpd.server_address[1]
+
+
+class _FakeJob(object):
+    def __init__(self, ok=True, dry=None, auto=False, targets=None, kind="update"):
+        self.id = "fake-notify"
+        self.kind = kind
+        self.targets = targets if targets is not None else ["demo"]
+        self.ok = ok
+        self.final_message = "完成 1 个容器的更新" if ok else "1 个容器未成功：demo"
+        self.steps = [{"key": "pull", "name": "拉取新镜像", "state": "failed",
+                       "message": "超时"}] if not ok else []
+        self.auto = auto
+        self.schedule_id = ""
+        self.dry = dry
+
+
+_recv = _Recv()
+os.environ["NOTIFY_WEBHOOK_URL"] = _recv.url
+os.environ["NOTIFY_WEBHOOK_TOKEN"] = "shared-token"
+ok("渠道能从环境变量读出来", [c["kind"] for c in _N44.channels()] == ["webhook"],
+   _N44.channels())
+ok("渠道信息里只有主机名，不含路径里的密钥",
+   "SECRET-XYZ" not in json.dumps(_N44.channels(), ensure_ascii=False))
+
+server.STORE.set_notify_mode("fail")
+ok("默认「仅失败」时，成功的任务不发通知",
+   _N44.notify_job(_FakeJob(ok=True), server.STORE, "1.5.3", wait=True) is False
+   and not _recv.got, _recv.got)
+ok("失败的任务会发", _N44.notify_job(_FakeJob(ok=False), server.STORE, "1.5.3",
+                                    wait=True) is True)
+ok("webhook 收到了一个请求", len(_recv.got) == 1, _recv.got)
+if _recv.got:
+    _body44 = _recv.got[0]["body"]
+    ok("请求带 X-Notify-Token 头", _recv.got[0]["token"] == "shared-token")
+    ok("payload 标了失败", _body44.get("ok") is False, _body44.get("ok"))
+    ok("payload 带容器与结果", _body44.get("targets") == ["demo"] and _body44.get("message"))
+    ok("正文点了失败步骤", "拉取新镜像" in (_body44.get("text") or ""), _body44.get("text"))
+    ok("标题带 ❌", "❌" in (_body44.get("title") or ""), _body44.get("title"))
+
+server.STORE.set_notify_mode("always")
+_recv.got.clear()
+_N44.notify_job(_FakeJob(ok=True), server.STORE, "1.5.3", wait=True)
+ok("「每次都发」时成功的任务也发", len(_recv.got) == 1, len(_recv.got))
+ok("标题带 ✅", _recv.got and "✅" in (_recv.got[0]["body"].get("title") or ""))
+_recv.got.clear()
+_N44.notify_job(_FakeJob(ok=True, dry=True), server.STORE, "1.5.3", wait=True)
+ok("干跑任务不发通知（没碰容器，纯噪音）", not _recv.got, _recv.got)
+
+server.STORE.set_notify_mode("off")
+_recv.got.clear()
+_N44.notify_job(_FakeJob(ok=False), server.STORE, "1.5.3", wait=True)
+ok("「关闭」时失败也不发", not _recv.got, _recv.got)
+
+# 页面设置：能改、能读回、非法值报错、不回传密钥
+_d44, _c44 = req("/api/settings", {"notify_mode": "always"})
+ok("POST /api/settings 能改通知时机", _c44 == 200 and _d44["data"]["notify_mode"] == "always",
+   _d44.get("data", {}).get("notify_mode"))
+ok("设置里能看到已配置渠道",
+   [c["kind"] for c in (_d44["data"].get("notify_channels") or [])] == ["webhook"])
+ok("设置响应不泄漏 webhook URL / token",
+   "SECRET-XYZ" not in json.dumps(_d44, ensure_ascii=False)
+   and "shared-token" not in json.dumps(_d44, ensure_ascii=False))
+_d44b, _c44b = req("/api/settings", {"notify_mode": "sometimes"})
+ok("非法值被拒（400）", _c44b == 400, _c44b)
+server.STORE.set_notify_mode("fail")
+os.environ.pop("NOTIFY_WEBHOOK_URL", None)
+os.environ.pop("NOTIFY_WEBHOOK_TOKEN", None)
+try:
+    _recv.httpd.shutdown()
+    _recv.httpd.server_close()
+except Exception:                                           # noqa: BLE001
+    pass
+
 # ---- 收尾：把还在跑的任务等完、把两个 HTTP 服务关掉再退出 ----
 # 否则守护线程会在解释器最终化时被硬杀，容易在退出阶段炸掉（CI 上实测 exit 139，
 # 而 131 项断言其实全过了 —— 问题出在收尾，不是测试本身）。

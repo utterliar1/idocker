@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import uuid
+from concurrent import futures
 
 import ikuai_api as A
 
@@ -50,6 +51,12 @@ HISTORY_LIMIT = 60
 # 每条历史保留多少行日志。日志是「事后唯一能还原现场的东西」——
 # 只存成功/失败，过几天回头看完全不知道当时发生了什么。
 LOG_KEEP = 500
+
+# 版本检测的并发路数。检测是「每个镜像各走一条加速源回退链」的纯 HTTP 查询，
+# 彼此不依赖，串行跑纯属浪费：实测 7 个镜像串行要 118 秒（大半耗在坏源超时上），
+# 4 路并发后总耗时接近「最慢那一个」。爱快本体的接口仍由 IKuai 自带的锁串行，
+# 所以这里加并发不会把路由器打满。
+CHECK_WORKERS = 4
 
 
 class BusyError(Exception):
@@ -1053,8 +1060,14 @@ class JobManager(object):
         # 用爱快自己配置的加速源去查，保证「检测的源」和「拉取的源」一致
         registries = A.resolve_registries(ik, cfg, job.log)
         job.log("查询上游用的加速源（来自爱快 Docker 服务设置）：%s" % "、".join(registries))
-        results, seen = [], set()
-        latest_cache = {}          # repo → latest digest，避免同一仓库重复查
+        cooling = [r for r in registries if A.source_cooling(r)]
+        if cooling:
+            job.log("加速源冷却中（上一轮刚失败过，本轮排到最后）：%s"
+                    % "、".join(cooling), level="warn")
+
+        # 先把要查的镜像去重列出来。顺序 = 容器顺序，结果也按这个顺序落 ——
+        # 并发查询只影响快慢，不影响页面上看到的行序和日志顺序。
+        plans, seen = [], set()
         for c in cs:
             image = c.get("image") or ""
             repo, tag = A.repo_of(image), A.split_image(image)[2]
@@ -1064,69 +1077,71 @@ class JobManager(object):
             seen.add(key)
             img = local.find(repo, tag)
             local_ts, _src = local.pulled_at(img)
-            # 本地镜像是「哪一份内容」的唯一依据：爱快记录的镜像 ID 就是
-            # config blob 的 sha256，和上游 amd64 子清单里的 config.digest 同层。
-            local_sig = str((img or {}).get("id") or "")
-            item = {"container": c["name"], "image": key, "local": local_ts or "—",
+            plans.append({
+                "container": c["name"], "repo": repo, "tag": tag, "key": key,
+                "local": local_ts or "—",
+                # 本地镜像是「哪一份内容」的唯一依据：爱快记录的镜像 ID 就是
+                # config blob 的 sha256，和上游 amd64 子清单里的 config.digest 同层。
+                "local_sig": str((img or {}).get("id") or ""),
+            })
+
+        probed = self._probe_upstream(plans, registries, cfg, job)
+        results = []
+        for p in plans:
+            key, tag, repo = p["key"], p["tag"], p["repo"]
+            local_sig = p["local_sig"]
+            hit = probed.get(key) or {}
+            # 并发时每个镜像的调试行先在各自线程里攒着，这里按顺序补发，
+            # 否则「调试详情」里几条镜像的记录会互相穿插，看不懂。
+            for level, line in hit.get("lines") or []:
+                job.log(line, level=level)
+            item = {"container": p["container"], "image": key, "local": p["local"],
                     "status": "unknown", "digest": "", "registry": "", "pinned": "",
                     "local_id": A.norm_digest(local_sig)[:12],
                     "upstream_id": "", "basis": ""}
-            try:
-                digest, up_cfg, reg = A.remote_platform_digest(
-                    registries, repo, tag, ctx, cfg["timeout"])
-                item["digest"], item["registry"] = digest[:19], reg
-                item["upstream_id"] = A.norm_digest(up_cfg)[:12]
-                item["status"], item["basis"] = self._judge(
-                    local_sig, up_cfg, digest, key)
-                # 容器锁在具体版本号 tag 上时（如 vaultwarden/server:1.37.3），该 tag 的
-                # 上游内容是固定的，上面必然得出「latest」。但那不等于没有新版 ——
-                # 该仓库的 latest 可能早就走远了。额外查一次 latest 作对比，把
-                # 「锁着、但上游已经前进」这件事显式暴露出来，否则用户看到的就是
-                # 「Docker Hub 明明有新版，idocker 却说已是最新」（实测踩过）。
-                if A.is_version_tag(tag):
-                    if repo not in latest_cache:
-                        try:
-                            latest_cache[repo] = A.remote_digest(
-                                registries, repo, "latest", ctx, cfg["timeout"])[0]
-                        except Exception as e:              # noqa: BLE001
-                            latest_cache[repo] = ""
-                            job.log("· 查询 %s:latest 失败：%s" % (repo, e), level="debug")
-                    lv = latest_cache[repo]
-                    if lv and lv != digest:
-                        item["pinned"] = "ahead"
-                # 逐个镜像都记一行，并带上命中的加速源 —— 事后回看历史时，
-                # 「查到的是哪个源的什么结果」比只看到一句「检测完成」有用得多。
-                st = item["status"]
-                if st == "newer":
-                    job.log("⬆ %s 上游有新版本（本地镜像 %s ≠ 上游 amd64 内容 %s，命中 %s）"
-                            % (key, item["local_id"] or "?", item["upstream_id"] or "?",
-                               reg), level="warn")
-                elif st == "latest":
-                    job.log("✓ %s 已是最新（本地镜像 %s == 上游 amd64 内容，命中 %s）"
-                            % (key, item["local_id"], reg))
-                elif st == "unknown":
-                    if item["basis"] == "digest":
-                        job.log("· %s 取不到上游内容指纹，只能按清单 digest 记基准"
-                                "（命中 %s）" % (key, reg), level="warn")
-                    else:
-                        job.log("· %s 首次检测，已记下上游指纹 %s（命中 %s）"
-                                % (key, item["upstream_id"] or digest[:19], reg))
-                if item["pinned"] == "ahead":
-                    job.log("⚑ %s 锁定在 %s，但 %s:latest 已更新"
-                            "（可用行内「指定版本」填 latest 切回跟随）"
-                            % (key, tag, repo), level="warn")
-                # ⚠️ 只有「确认已是最新」才刷新基准。
-                # 旧代码这里无条件覆盖，于是「有新版本」只活一个检测周期 ——
-                # 下次检测拿新 digest 跟自己比当然相等，报告自我消化掉，
-                # 用户看到的就是「明明有新版本却说已是最新」（线上踩过）。
-                if st != "newer":
-                    self._remember_digest(key, digest, reg)
-                results.append(item)
-            except Exception as e:
+            err = hit.get("error") or ""
+            if err:
                 item["status"] = "failed"
-                item["digest"] = str(e).splitlines()[0][:60]
+                item["digest"] = err.splitlines()[0][:60]
                 job.log("✗ 查询 %s 失败：%s" % (key, item["digest"]), level="error")
                 results.append(item)
+                continue
+            digest = hit.get("digest") or ""
+            up_cfg = hit.get("up_cfg") or ""
+            reg = hit.get("reg") or ""
+            item["digest"], item["registry"] = digest[:19], reg
+            item["upstream_id"] = A.norm_digest(up_cfg)[:12]
+            item["status"], item["basis"] = self._judge(local_sig, up_cfg, digest, key)
+            if hit.get("pinned") == "ahead":
+                item["pinned"] = "ahead"
+            # 逐个镜像都记一行，并带上命中的加速源 —— 事后回看历史时，
+            # 「查到的是哪个源的什么结果」比只看到一句「检测完成」有用得多。
+            st = item["status"]
+            if st == "newer":
+                job.log("⬆ %s 上游有新版本（本地镜像 %s ≠ 上游 amd64 内容 %s，命中 %s）"
+                        % (key, item["local_id"] or "?", item["upstream_id"] or "?",
+                           reg), level="warn")
+            elif st == "latest":
+                job.log("✓ %s 已是最新（本地镜像 %s == 上游 amd64 内容，命中 %s）"
+                        % (key, item["local_id"], reg))
+            elif st == "unknown":
+                if item["basis"] == "digest":
+                    job.log("· %s 取不到上游内容指纹，只能按清单 digest 记基准"
+                            "（命中 %s）" % (key, reg), level="warn")
+                else:
+                    job.log("· %s 首次检测，已记下上游指纹 %s（命中 %s）"
+                            % (key, item["upstream_id"] or digest[:19], reg))
+            if item["pinned"] == "ahead":
+                job.log("⚑ %s 锁定在 %s，但 %s:latest 已更新"
+                        "（可用行内「指定版本」填 latest 切回跟随）"
+                        % (key, tag, repo), level="warn")
+            # ⚠️ 只有「确认已是最新」才刷新基准。
+            # 旧代码这里无条件覆盖，于是「有新版本」只活一个检测周期 ——
+            # 下次检测拿新 digest 跟自己比当然相等，报告自我消化掉，
+            # 用户看到的就是「明明有新版本却说已是最新」（线上踩过）。
+            if st != "newer":
+                self._remember_digest(key, digest, reg)
+            results.append(item)
         job.step("query", "done", "共检查 %d 个镜像" % len(results))
         job.emit("check_result", results=results)
         self._save_last_check(results)
@@ -1138,6 +1153,78 @@ class JobManager(object):
             job.log("另有 %d 个容器锁定在固定版本 tag，latest 已更新：%s"
                     % (len(pinned), "、".join(pinned)), level="warn")
         return True, "已检查 %d 个镜像" % len(results)
+
+    # -- 上游并发查询 ----------------------------------------------
+    def _probe_upstream(self, plans, registries, cfg, job):
+        """并发查上游，返回 ``{repo:tag: {digest, up_cfg, reg, pinned, error, lines}}``。
+
+        为什么要并发：检测是「一个镜像 × 一条加速源回退链」，串行时每个镜像都要
+        挨个等（实测 7 个镜像 118 秒，其中 104 秒耗在一个握不上手的坏源上）。
+        这些查询是纯 HTTP、彼此不依赖，4 路并发后总耗时接近「最慢那一个」。
+
+        每个镜像的调试日志先在各自线程里攒着，交给调用方按顺序补发 —— 直接在线程
+        里 log 会让「调试详情」里的几行互相穿插。
+        """
+        out = {}
+        if not plans:
+            return out
+        workers = max(1, min(CHECK_WORKERS, len(plans)))
+        job.log("并发查询 %d 个镜像（%d 路）…" % (len(plans), workers))
+        latest_lock = threading.Lock()
+        latest_cache = {}          # repo → latest digest，避免同一仓库重复查
+        extra_notes = []
+
+        def latest_of(repo):
+            with latest_lock:
+                if repo in latest_cache:
+                    return latest_cache[repo]
+            try:
+                val = A.remote_digest(registries, repo, "latest", None,
+                                      cfg["timeout"])[0]
+            except Exception as e:                              # noqa: BLE001
+                val = ""
+                with latest_lock:
+                    extra_notes.append("· 查询 %s:latest 失败：%s" % (repo, e))
+            with latest_lock:
+                latest_cache[repo] = val
+            return val
+
+        def probe(p):
+            lines = []
+            line_ctx = A.Ctx(logger=lambda m, level="info": lines.append((level, str(m))),
+                             verbose=True)
+            hit = {"lines": lines, "digest": "", "up_cfg": "", "reg": "",
+                   "pinned": "", "error": ""}
+            try:
+                digest, up_cfg, reg = A.remote_platform_digest(
+                    registries, p["repo"], p["tag"], line_ctx, cfg["timeout"])
+                hit.update(digest=digest, up_cfg=up_cfg, reg=reg)
+                # 容器锁在具体版本号 tag 上时（如 vaultwarden/server:1.37.3），该 tag 的
+                # 上游内容是固定的，上面必然得出「latest」。但那不等于没有新版 ——
+                # 该仓库的 latest 可能早就走远了。额外查一次 latest 作对比，把
+                # 「锁着、但上游已经前进」这件事显式暴露出来，否则用户看到的就是
+                # 「Docker Hub 明明有新版，idocker 却说已是最新」（实测踩过）。
+                if A.is_version_tag(p["tag"]):
+                    lv = latest_of(p["repo"])
+                    if lv and lv != digest:
+                        hit["pinned"] = "ahead"
+            except Exception as e:                              # noqa: BLE001
+                hit["error"] = str(e)
+            return hit
+
+        with futures.ThreadPoolExecutor(max_workers=workers,
+                                        thread_name_prefix="idocker-check") as ex:
+            submitted = [(p, ex.submit(probe, p)) for p in plans]
+            for p, fut in submitted:
+                try:
+                    out[p["key"]] = fut.result()
+                except Exception as e:                          # noqa: BLE001
+                    out[p["key"]] = {"lines": [], "digest": "", "up_cfg": "", "reg": "",
+                                     "pinned": "",
+                                     "error": "%s: %s" % (type(e).__name__, e)}
+        for note in extra_notes:
+            job.log(note, level="debug")
+        return out
 
     # -- 上次检测结果（页面刷新后仍能显示上游状态）--------------------
     def _last_check_path(self):
