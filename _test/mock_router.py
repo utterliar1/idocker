@@ -92,6 +92,9 @@ class Fake(object):
         self.sub_map = {}
         # 各仓库的上游 tag 列表；不指定时按本地镜像记录推出来
         self.tags = {}
+        # 上游**不存在**的 tag（"repo:tag"）。真 registry 回 404，而爱快对这种情况
+        # 不报错，只会下发一个永不完成的下载任务 —— 正是「白等 600 秒超时」的来源。
+        self.missing_tags = set()
         # 爱快自己那个「可用版本」接口返回什么（None 表示恒为空，实测 mihomo 就是）
         self.ikuai_tags = ["latest", "1.7.2", "1.8.0"]
         self.del_calls = []
@@ -291,6 +294,17 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/v2/(.+)/manifests/([^/?]+)", self.path)
         if m:
             repo, ref = m.group(1), m.group(2)
+            # 模拟「上游根本没有这个 tag」：真 registry 回 404，而爱快对这种情况
+            # 不会报错，只会下发一个永不完成的下载任务。
+            if ("%s:%s" % (repo, ref)) in FAKE.missing_tags:
+                body = json.dumps({"errors": [{"code": "MANIFEST_UNKNOWN",
+                                               "message": "manifest unknown"}]}).encode()
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             # 子清单（多架构里某个平台的 manifest）：正文里带本平台那份的 config.digest
             if ref in FAKE.sub_map:
                 srepo, stag = FAKE.sub_map[ref]

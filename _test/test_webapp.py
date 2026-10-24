@@ -1579,6 +1579,43 @@ try:
 except Exception:                                           # noqa: BLE001
     pass
 
+print("\n=== 45. 上游没有这个 tag：拉之前就问清楚，不白等下载超时 ===")
+_A45 = server.A
+_REG45 = "http://127.0.0.1:%d" % PORT
+_A45._source_health.clear()
+mock_router.FAKE.missing_tags = {"dreamacro/clash:v9.9.9"}
+ok("存在的 tag 判 yes",
+   _A45.remote_tag_exists([_REG45], "dreamacro/clash", "latest")[0] == "yes")
+ok("不存在的 tag 判 no",
+   _A45.remote_tag_exists([_REG45], "dreamacro/clash", "v9.9.9")[0] == "no")
+ok("源全连不上时判 unknown（绝不误报「tag 不存在」）",
+   _A45.remote_tag_exists(["http://127.0.0.1:1"], "dreamacro/clash",
+                          "latest")[0] == "unknown")
+ok("404 不会把加速源标成坏源", _A45.source_cooling(_REG45) is False)
+
+# 端到端：指定一个上游不存在的 tag，必须立刻失败，而不是等满下载超时
+mock_router.FAKE.install_calls.clear()
+mock_router.FAKE.update_calls.clear()
+_t45 = time.time()
+_d45, _ = req("/api/update", {"containers": ["clash"], "tag": "v9.9.9"})
+_j45 = wait_job(_d45["job_id"])
+_el45 = time.time() - _t45
+_hist45, _ = req("/api/history/" + _j45["id"])
+_log45 = "\n".join((l.get("message") or "") for l in (_hist45["data"].get("logs") or []))
+ok("任务判失败", _j45["ok"] is False, _j45.get("message"))
+ok("几秒内结束（没有白等 60s 下载超时）", _el45 < 20, "%.1fs" % _el45)
+ok("日志点名「没有 dreamacro/clash:v9.9.9 这个 tag」",
+   "没有 dreamacro/clash:v9.9.9 这个 tag" in _log45, _log45[-300:])
+ok("日志给了下一步（用「指定版本」选真实存在的版本）", "指定版本" in _log45)
+ok("没有发起下载（install 没被调用）",
+   not [x for x in mock_router.FAKE.install_calls if x[1] == "v9.9.9"],
+   mock_router.FAKE.install_calls)
+ok("没有重启容器（update 没被调用）", not mock_router.FAKE.update_calls,
+   mock_router.FAKE.update_calls)
+ok("「拉取新镜像」步骤标 failed", step_states(_j45).get("pull") == "failed",
+   step_states(_j45))
+mock_router.FAKE.missing_tags = set()
+
 # ---- 收尾：把还在跑的任务等完、把两个 HTTP 服务关掉再退出 ----
 # 否则守护线程会在解释器最终化时被硬杀，容易在退出阶段炸掉（CI 上实测 exit 139，
 # 而 131 项断言其实全过了 —— 问题出在收尾，不是测试本身）。

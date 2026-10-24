@@ -408,6 +408,29 @@ class JobManager(object):
             # 提前到这里，是因为上面「定时先看上游变没变」也要用它。
             using_it = (cur_tag == new_tag)
 
+            # ---- 拉之前先确认上游到底有没有这个 tag ----
+            # 爱快对「本地没有、上游也没有」的 tag 不会报错，它会照常下发一个下载
+            # 任务、一个字节都不下，然后让「等待下载」白等满整个超时（默认 600s），
+            # 最后吐一句「超时」—— 原因还是错的。tag 拼错、上游删了某个版本都属于
+            # 「等再久也不会有结果」，所以这里先问清楚再决定要不要拉。
+            tag_state, tag_detail = A.remote_tag_exists(
+                registries(), repo, new_tag, ctx, cfg["timeout"])
+            if tag_state == "no":
+                job.step("pull", "failed", "上游没有这个 tag")
+                job.log("❌ %s：上游（%s）没有 %s:%s 这个 tag。"
+                        "拼错了、或者上游把这个版本删了，都属于「等再久也不会有结果」，"
+                        "所以没有发起下载（省掉一整轮下载超时）。"
+                        "请用行内「指定版本」从列表里选一个真实存在的版本。"
+                        % (c["name"], tag_detail, repo, new_tag), level="error")
+                failures.append(c["name"])
+                continue
+            if tag_state == "unknown":
+                job.log("⚠ 无法确认上游是否有 %s:%s（%s）—— 继续按正常流程拉取，"
+                        "下载仍受 %ds 超时限制"
+                        % (repo, new_tag, tag_detail, pull_t), level="warn")
+            else:
+                job.log("上游确认存在 %s:%s（命中 %s）" % (repo, new_tag, tag_detail))
+
             # 定时任务（auto）先看本地镜像和上游**内容**是不是同一份。只有真的不同
             # 才值得走一遍拉取 + 重启；否则每次定时跑都重启容器会平白中断服务。
             #
@@ -699,9 +722,15 @@ class JobManager(object):
                                        A.norm_digest(_acfg)[:12] or "未知"), level="error")
                         else:
                             job.log("❌ %s 的镜像未在 %ds 内下载完成（%s）。本次跳过该容器，"
-                                    "不会用旧镜像重建。若镜像较大或加速源较慢，"
+                                    "不会用旧镜像重建。%s"
+                                    "若镜像较大或加速源较慢，"
                                     "可在页面的「设置」里把下载超时调大后重试。"
-                                    % (c["name"], pull_t, note or "超时"), level="error")
+                                    % (c["name"], pull_t, note or "超时",
+                                       ("上游已确认存在 %s:%s（命中 %s），所以这是"
+                                        "「爱快没下完」，不是 tag 写错了。"
+                                        % (repo, new_tag, tag_detail))
+                                       if tag_state == "yes" else ""),
+                                    level="error")
                         failures.append(c["name"])
                         continue
 

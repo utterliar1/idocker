@@ -777,6 +777,43 @@ def remote_digest(registries, image, tag, ctx=None, timeout=20):
                      % (image, tag, "；".join(errors) if errors else "无可用源"))
 
 
+def remote_tag_exists(registries, image, tag, ctx=None, timeout=20):
+    """上游到底有没有 ``repo:tag`` —— 拉之前先问清楚。返回 ``(state, detail)``：
+
+    ``"yes"``     至少一个源确认存在（detail = 命中的源）
+    ``"no"``      所有能给出答案的源都说没有（HTTP 404）
+    ``"unknown"`` 源都联系不上/被拒，无法判断（detail = 失败原因汇总）
+
+    为什么必须在拉之前问：爱快对「本地没有、上游也没有」的 tag **不会报错**，
+    它照常下发一个下载任务，然后一个字节都不下，最后要等满整个下载超时
+    （默认 600s）才吐一句「超时」。tag 拼错、上游删了某个版本，都属于
+    「等再久也不会有结果」—— 拿超时去猜是最差的做法，10 分钟白等，
+    报出来的原因还是错的（实测 lucky 指定 v3.4.0_xiaojv_waf 就是这么白等的）。
+
+    404 不把源标记成坏源：那是「这个源没有这个镜像」，源本身是健康的。
+    """
+    repo = _repo_path(image)
+    not_found, unreachable = [], []
+    for reg in order_sources(registries):
+        try:
+            _registry_get(reg, repo, "manifests/" + tag, ctx, timeout,
+                          {"Accept": ACCEPT_MANIFEST})
+            mark_source_ok(reg)
+            return "yes", reg
+        except Exception as e:                                   # noqa: BLE001
+            if "HTTP 404" in str(e):
+                not_found.append(reg)
+            else:
+                mark_source_bad(reg, e)
+                unreachable.append("%s → %s" % (reg, e))
+    if not_found and not unreachable:
+        return "no", "、".join(not_found)
+    if not_found:
+        return "unknown", ("%s 说没有，但 %s 连不上，判断不了"
+                           % ("、".join(not_found), "；".join(unreachable)))
+    return "unknown", "；".join(unreachable) or "无可用源"
+
+
 def _config_digest_of(reg, repo, body, ctx, timeout, arch, os_name, depth=0):
     """从 manifest 里取出「指定平台那份镜像」的 config digest。
 

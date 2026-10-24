@@ -53,7 +53,7 @@ import notify as N             # noqa: E402
 import scheduler as SC         # noqa: E402
 import store as S              # noqa: E402
 
-VERSION = "1.5.3"
+VERSION = "1.5.4"
 CFG = A.load_config()
 MANAGER = J.JobManager(CFG)
 # 持久化设置：页面里改的下载超时、定时任务、通知时机都落在这里（Docker 卷 /data）

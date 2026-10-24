@@ -33,6 +33,7 @@ The frontend timing suite must run with ?autocheck=0 in its test setup. Tests th
 - Version checks must keep registry source health (ikuai_api.order_sources / mark_source_bad): a dead mirror is retried once, then moved to the end of the fallback chain for SOURCE_COOLDOWN seconds. Dropping it makes every image wait out the same timeout (measured: 118s for 7 images). HTTP 404 must never mark a source bad — that is "this mirror lacks this image", not a broken mirror.
 - Check jobs query upstream concurrently (jobs.CHECK_WORKERS). Results and per-image debug lines must still be emitted in container order.
 - Notification channels come from environment variables only (NOTIFY_WEBHOOK_URL / NOTIFY_WEBHOOK_TOKEN / NOTIFY_PUSHPLUS_TOKEN). Never send the full URL or token to the browser — `/api/settings` exposes labels only. Sends are asynchronous and must never block job teardown; dry-run jobs are not announced.
+- Before triggering a pull, resolve the tag upstream (ikuai_api.remote_tag_exists) and fail immediately when every source answers 404. iKuai does not error on a tag that does not exist — it queues a download that never completes and makes the job wait out the whole pull timeout, then reports "timeout" as the reason. Never treat "unknown" (all sources unreachable) as "tag missing".
 
 ## Release and Deployment
 
