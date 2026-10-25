@@ -1213,7 +1213,7 @@
           : '<span class="muted">未使用</span>') + '</td>' +
         '<td class="r" data-label="">' +
           '<button class="btn tiny ghost img-pull" data-repo="' + esc(img.name) + '" data-tag="' +
-            esc(tags[0] || "latest") + '">更新</button> ' +
+            esc(pickTag(tags)) + '">拉取最新</button> ' +
           '<button class="btn tiny ghost danger-text img-del" data-repo="' + esc(img.name) + '" data-tag="' +
             esc(tags[0] || "latest") + '"' + (users.length ? ' disabled title="被容器占用，不能删"' : '') +
             '>删除</button>' +
@@ -1226,6 +1226,15 @@
     Array.prototype.forEach.call(document.querySelectorAll(".img-del"), function (b) {
       b.addEventListener("click", function () { deleteImage(b.dataset.repo, b.dataset.tag); });
     });
+  }
+
+  // 拉取时优先 latest：镜像记录可能同时挂着 1.37.3,latest 两个 tag，
+  // 拿第一个去拉会变成「重复拉同一个旧版本」。
+  function pickTag(tags) {
+    for (var i = 0; i < tags.length; i++) {
+      if (tags[i] === "latest") return "latest";
+    }
+    return tags[0] || "latest";
   }
 
   function searchImages() {
@@ -1868,6 +1877,13 @@
   Array.prototype.forEach.call(document.querySelectorAll("[data-goto]"), function (b) {
     b.addEventListener("click", function () { goPage(b.getAttribute("data-goto")); });
   });
+  // 前进/后退、手改地址栏里的 #hash 也要切页（否则只有点导航才生效）
+  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+    window.addEventListener("hashchange", function () {
+      var hp = (location.hash || "").replace("#", "");
+      if (PAGE_TITLES[hp] && hp !== state.page) goPage(hp);
+    });
+  }
   document.addEventListener("keydown", function (e) {
     if ((e.key === "Escape" || e.keyCode === 27)) {
       if (!$("cfmModal").classList.contains("hidden")) return closeBox(false);

@@ -522,3 +522,58 @@ select.input { cursor: pointer; }
   .drawer { width: 100%; }
   .hmsg { display: none; }
 }
+
+/* ============================================================
+   深色主题：跟随系统。只覆盖变量 + 少数硬编码的浅色底，
+   布局与间距全部复用上面的规则，避免两套样式漂移。
+   ============================================================ */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0e1116;
+    --surface: #161a20;
+    --surface-2: #1b2028;
+    --line: #262c36;
+    --line-strong: #333a46;
+    --text: #e6e9ee;
+    --text-2: #a7b0bd;
+    --text-3: #737d8c;
+    --accent: #818cf8;
+    --accent-weak: #232842;
+    --ok: #34d399;
+    --ok-weak: #12331f;
+    --warn: #fbbf24;
+    --warn-weak: #2a2109;
+    --danger: #f87171;
+    --danger-weak: #2d1210;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 8px 24px rgba(0, 0, 0, .35);
+  }
+
+  .tbl th { background: var(--surface-2); }
+  .tbl td,
+  .mini-row + .mini-row,
+  .kv-row + .kv-row,
+  .hrow + .hrow,
+  .search-item + .search-item { border-color: #222833; }
+  .tbl tr.need-upd { background: #221d0e; }
+  .tbl tr.row-pinned { background: #211c10; }
+  .tbl tbody tr:hover { background: #1b2028; }
+
+  .btn.primary { color: #12141a; }
+  .btn.primary:hover { background: #a5b4fc; border-color: #a5b4fc; }
+  .btn.danger { color: #12141a; }
+  .seg-item.on { background: #262c36; color: #c7cdff; }
+  .tag-chip.on { color: #12141a; }
+  .nav-item.on .nav-count { background: var(--surface-2); border-color: #3a3f63; }
+  .badge.newer { border-color: #4a3a12; }
+  .badge.latest { border-color: #1c4a31; }
+  .badge.failed { border-color: #4d2320; }
+  .badge.pin { background: #2e2410; border-color: #4a3a12; color: #f2c66d; }
+  .banner.warn { background: #2a2109; border-color: #4a3a12; color: #f2c66d; }
+  .banner.err { background: #2d1210; border-color: #4d2320; color: #f19c96; }
+  .led.down { box-shadow: 0 0 0 3px #232833; }
+  .bar-track i { background: linear-gradient(90deg, #4f46e5, #818cf8); }
+  .modal { background: rgba(0, 0, 0, .6); }
+  .exec { box-shadow: 0 12px 40px rgba(0, 0, 0, .6); }
+  .drawer { box-shadow: -12px 0 40px rgba(0, 0, 0, .5); }
+  .toast { box-shadow: 0 10px 30px rgba(0, 0, 0, .55); }
+}
