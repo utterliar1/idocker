@@ -30,10 +30,12 @@ ACCEPT_MANIFEST = ", ".join([
     "application/vnd.oci.image.index.v1+json",
 ])
 
+# 只是兜底：正常情况下用的是爱快 Docker 服务设置里配的加速源。
+# docker.nju.edu.cn 实测对 /v2/ 直接回 403（2026-10 复测），换成 hub.rat.dev。
 DEFAULT_REGISTRIES = [
     "https://docker.1ms.run",
     "https://docker.m.daocloud.io",
-    "https://docker.nju.edu.cn",
+    "https://hub.rat.dev",
 ]
 
 WRITE_ACTIONS = {"install", "add", "update", "del", "delete", "remove",
