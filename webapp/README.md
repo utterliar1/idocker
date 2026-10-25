@@ -5,7 +5,7 @@
 
 把 [爱快（iKuai）](https://www.ikuai8.com/) 路由器上的 Docker **管起来**：容器、镜像、网络、Compose、服务设置、定时任务、操作审计，一个网页全包，跑在**飞牛 NAS（fnOS）**的 Docker 里。核心的更新流程保留**六步可视化执行 + 实时日志**。
 
-打开网页 → 概览直接告诉你有没有要更新的、有几个 → 点「更新这 N 个」→ 确认后六步流程实时点亮 → 完成。日常管理走左侧导航，任何写操作都先弹预览、执行后自动回读确认。
+打开网页 → **概览**告诉你有没有要更新的、有几个 → 切到**容器**页点「更新这 N 个」→ 确认后六步流程实时点亮 → 完成。日常管理走左侧导航（容器 / 镜像 / 网络 / 编排 / 定时任务 / 历史 / 审计），**任何写操作都先弹预览、执行后自动回读确认**。
 
 > 镜像地址：`ghcr.io/utterliar1/idocker`，容器名 `idocker`。改一行配置就能用，见下方**方式 A**。
 
@@ -27,7 +27,7 @@
 
 ![版本检测](screenshots/04-版本检测.png)
 
-> 以上截图取自**实际部署在飞牛（fnOS）上的容器**，操作的是路由器上真实的 7 个容器，不是本地开发环境。
+> 以上截图取自**实际部署在飞牛（fnOS）上的容器**，操作的是路由器上真实的 7 个容器与 8 个镜像，不是本地开发环境。
 
 ---
 
@@ -46,6 +46,11 @@
 | **执行历史** | 每次执行的成功/失败、每步耗时、完整日志 |
 | **操作审计** | 所有手动管理动作留痕（含失败），**凭据字段自动打码** |
 
+界面骨架：
+
+- **左侧**：8 个页面（概览 / 容器 / 镜像 / 网络 / 编排 / 定时任务 / 执行历史 / 操作审计），底部只有版本号和「退出登录」；地址栏带 `#containers` 这种 hash，前进后退和收藏都能用；
+- **顶栏**：`演练` 开关、自动刷新倒计时、设置齿轮、刷新、检查更新。设置（下载超时 / 任务通知 / 镜像加速源）收在齿轮里，不占主界面。
+
 配套的三条硬规则：
 
 1. **写操作一定回读**——爱快写接口是异步的，`update` / `add` 甚至返回空 body，「回 Success」不等于生效，所以每个动作之后都要重新读一遍状态才算成功；
@@ -61,7 +66,7 @@
 | 能力 | 说明 |
 |---|---|
 | **概览条** | 容器表上方常驻一句结论：`⬆ 有 3 个容器可以更新` / `✓ 全部已是最新` / `尚未检测`，旁边就是「更新这 N 个」。可更新的容器**自动置顶 + 整行高亮**，不用自己翻表找 |
-| 容器总览 | 名称、镜像、运行状态、固定 IP、本地镜像拉取时间 |
+| 容器列表 | 名称 + 固定 IP、镜像 + tag + 本地拉取时间、运行状态、**实时 CPU / 内存**、上游版本状态；支持搜索与「仅看运行中 / 已停止 / 有新版本」筛选 |
 | 版本检测 | 查上游 **amd64 子清单的 `config.digest`**，与**本地镜像 ID** 逐位比对 —— 本地这份到底是不是最新，一问便知（不再靠「上游 digest 有没有变」这种自说自话）。加速源**取自爱快 Docker 服务设置**，与拉取侧同源，不会再出现「工具说有新版、爱快却拉不到」 |
 | **打开就自动检测** | 上次结果超过 10 分钟就在后台静默重检一次，不用记得点「检查更新」；完成后轻提示报结论。`?autocheck=0` 可关 |
 | 一键更新 | 走爱快 4.0 原生 `docker_container.update` **就地更新**，不删容器，挂载/固定 IP/环境变量全部保留。**更新前先弹确认框列出到底动谁** |
@@ -72,7 +77,7 @@
 | 版本锁定 | 可选任意 tag 更新：下拉框优先用爱快的列表，**它返回空就直连加速源读 `/tags/list`**（实测 `metacubex/mihomo` 的列表恒为空）；还能**手填**列表里没有的 tag |
 | **定时任务** | 按「每 N 分钟」或「每天 HH:MM」自动检测指定容器，**有新版本才更新**，没变化绝不动容器 |
 | **可调超时** | 下载等待时长在页面上随时可改（60 ~ 7200 秒），落盘持久化 |
-| **手机 / 深色** | 窄屏把表格转成卡片式，不再需要横向拖动；深色主题跟随系统 |
+| **手机 / 深色** | 窄屏下侧栏收成顶部横排、只留图标（带 title 提示），表格在卡片内横向滚动，整页不会横向溢出；深色主题跟随系统，按钮/标签/告警的对比度单独调过 |
 | 执行历史 | 最近 60 次执行记录，**每条都能点开看完整日志**（含失败原因、每步耗时），支持一键复制 |
 
 **为什么不用 Watchtower 那类方案**：Watchtower 需要挂载 `docker.sock`、要提权、还会脱离爱快的编排层（爱快 UI 用自己的库登记容器，外部重建后列表和配置会乱）。本方案走爱快自己的 HTTP API，**不依赖任何漏洞、不需要 SSH、不脱离爱快编排层**。
@@ -96,7 +101,9 @@
 打完还会把镜像真拉起来起容器冒烟验证一遍。所以直接用就行，不用自己 build。
 
 ```bash
-mkdir -p /vol1/1000/docker/idocker && cd /vol1/1000/docker/idocker
+mkdir -p /vol1/1000/docker/idocker/data && cd /vol1/1000/docker/idocker
+# 数据目录要让容器里的 appuser（uid 1000）能写；飞牛上用你自己的账号建目录即可，
+# 若目录属 root 就 chown 1000:1000 一下，否则历史/定时任务存不下来。
 
 cat > docker-compose.yml <<'YAML'
 services:
@@ -115,15 +122,18 @@ services:
       PULL_TIMEOUT: "1800"          # 大镜像等久一点
       TZ: "Asia/Shanghai"
     volumes:
-      - ikuai-updater-data:/data
-
-volumes:
-  ikuai-updater-data:
+      # ⚠️ 写宿主机绝对路径。用 ./data 这种相对路径时，Docker 是按「执行 compose
+      #    的那台机器」解析的；在别的机器/容器里跑 compose 会就地建一个空目录挂进去，
+      #    历史、定时任务、上次检测结果全没，而且目录属 root，容器里的非 root 用户写不进去。
+      - /vol1/1000/docker/idocker/data:/data
 YAML
 
 docker compose up -d
 docker compose logs -f              # 看到启动横幅即成功，Ctrl+C 退出
 ```
+
+> 想用 Docker 命名卷（`ikuai-updater-data:/data`）也行，适合只在飞牛本机部署的场景；
+> 但只要 compose 可能在别处执行，就用上面的绝对路径 —— 理由写在挂载那行注释里。
 
 可用标签：
 
@@ -131,7 +141,7 @@ docker compose logs -f              # 看到启动横幅即成功，Ctrl+C 退�
 |---|---|
 | `latest` | main 分支每次推送 |
 | `sha-xxxxxxx` | 每次构建，钉住具体 commit |
-| `1.5.2`、`1.5` | 推 `v1.5.2` 这样的 tag 时 |
+| `1.6.0`、`1.6` | 推 `v1.6.0` 这样的 tag 时 |
 
 > 拉不动 ghcr.io 的话，给镜像名加个加速前缀即可，例如
 > `docker.1ms.run/ghcr.io/utterliar1/idocker:latest`。
@@ -167,7 +177,7 @@ AUTH_PASS=你自己设的访问密码       # 留空 = 不认证，只建议纯�
 
 WEB_PORT=8088                    # 对外端口（注意：飞牛上 8088 常被 filebrowser 占用，冲突就改）
 PULL_TIMEOUT=240                 # 等镜像下载的最长秒数，镜像大就调大
-DRY_RUN=0                        # 1 = 全程干跑
+DRY_RUN=0                        # 1 = 全程只演练，不改任何容器
 REGISTRIES=https://docker.1ms.run,https://hub.rat.dev,https://docker.m.daocloud.io
 
 BASE_IMAGE=python:3.13-alpine    # 构建用基础镜像；拉不到 docker.io 时换成加速源，见下方
@@ -215,7 +225,8 @@ docker compose logs -f          # 看到启动横幅即成功，Ctrl+C 退出
 
 浏览器访问 `http://飞牛IP:8088`，输入第二步设的访问账号密码。
 
-顶部会显示 `192.168.123.1 · 账号 admin · Docker 28.3.3 · 服务运行中`，下面列出所有容器。
+顶栏副标题会显示 `192.168.123.1 · 账号 admin · Docker 28.3.3 · 服务运行中`；
+左侧导航切到「容器」就能看到全部容器，概览页则是四张统计卡 + 资源 TOP。
 
 ---
 
@@ -231,8 +242,10 @@ docker compose logs -f          # 看到启动横幅即成功，Ctrl+C 退出
 | 端口冲突 | 飞牛 `8088` 被 `filebrowser` 占用 → 改用 `3001` |
 | 容器读取 | 7 个容器、8 个本地镜像，数据与爱快后台一致 |
 | 版本检测 | 7 个镜像全部检测成功，上游状态正确显示 |
-| 六步更新流程 | 干跑与真实更新均验证通过；已是最新时正确跳过重启 |
+| 六步更新流程 | 演练与真实更新均验证通过；已是最新时正确跳过重启 |
 | 健康检查 | 容器 `healthy` |
+| 管理动作 | 启停 / 重启 / 日志 / 详情、镜像拉取与删除保护、网络增删、Compose 操作、服务设置读写，全部「执行后回读」通过 |
+| 接口耗时（7 容器） | `/api/overview` 约 1.1 秒；`/api/stats`（并发聚合 CPU/内存）约 1.4 秒 |
 
 ### 实机验证暴露并修掉的 3 个真实 Bug
 **① 运行中的容器被误显示成「本地未安装」**
@@ -271,7 +284,8 @@ docker compose logs -f          # 看到启动横幅即成功，Ctrl+C 退出
 
 ## 使用
 
-打开页面会**自己检测一次上游版本**（10 分钟内的旧结果会直接复用），所以正常情况下什么都不用点 ——
+打开页面会**自己检测一次上游版本**（10 分钟内的旧结果会直接复用），所以正常情况下什么都不用点。
+先看**概览**页的四张卡（容器 / 本地镜像 / 可更新 / Docker 磁盘），再切到**容器**页操作 ——
 容器表上方的**概览条**会直接给出结论：
 
 1. **概览条**（容器表上方常驻）
@@ -289,8 +303,9 @@ docker compose logs -f          # 看到启动横幅即成功，Ctrl+C 退出
    演练模式下确认框会写明「不会真的重启容器」，按钮也变成「开始演练」。
 
 3. **勾选多个 + 「更新选中」** —— 批量按顺序更新，进度条显示 `[2/3]` 这样的计数。
-4. **「指定版本」按钮** —— 列出该镜像的全部可用 tag，选一个即可锁定版本更新（比如从 `latest` 换成 `1.37.3`）。
-5. **「演练模式」** —— 勾上后全程只演练、不发写请求，日志里会明确标注哪些步骤被跳过。**建议第一次先开着演练跑一遍。**
+4. **行内「版本」按钮** —— 列出该镜像的全部可用 tag，选一个即可锁定版本更新（比如从 `latest` 换成 `1.37.3`）；也可以直接手填。
+5. **行内「日志 / 详情」** —— 右侧抽屉里看最近 30 分钟日志、容器配置、实时 CPU/内存/上下行，不用再跳去爱快后台。
+6. **顶栏「演练」** —— 勾上后全程只演练、不发写请求，步骤说明会标「演练：跳过等待」这类字样。**建议第一次先开着演练跑一遍。**
 
 ### 打开就自动检测（不用记得点「检查更新」）
 
@@ -417,7 +432,7 @@ amd64 的内容一个字都没动。只有 `config.digest` 才和本地镜像 ID
 ### 下载超时（镜像大怎么办）
 
 镜像下载是**爱快后台自己做的**，本工具只负责轮询确认。等待上限默认 **900 秒（15 分钟）**，
-可以在页面右上角 **「设置」** 里随时改（范围 60 ~ 7200 秒）。改完立刻生效，
+可以在顶栏齿轮 **「设置」** 里随时改（范围 60 ~ 7200 秒）。改完立刻生效，
 并**落盘到容器卷 `/data/settings.json`**，重新构建镜像、重启容器都不会丢。
 
 - 几百 MB 的镜像：600 秒够用；
@@ -446,7 +461,7 @@ amd64 的内容一个字都没动。只有 `config.digest` 才和本地镜像 ID
 
 - 渠道只从环境变量读，**页面只显示「配了哪些」，完整 URL 和 token 不下发浏览器**；
 - 通知**异步发**，webhook 那头慢或挂掉不会拖住任务收尾；
-- **干跑任务不发**（它没碰任何容器，纯噪音）；
+- **演练任务不发**（它没碰任何容器，纯噪音）；
 - 正文会单独点出**失败的步骤**，这是「半夜到底挂在哪」的唯一线索。
 
 ### 定时任务（自动检测 / 自动更新）
@@ -480,9 +495,11 @@ amd64 的内容一个字都没动。只有 `config.digest` 才和本地镜像 ID
 
 ```
 http://飞牛IP:8088/?autorun=check                  打开即自动开始版本检测
-http://飞牛IP:8088/?autorun=update&container=clash&dry=1   预览更新流程（强制干跑，URL 无法触发真实更新）
+http://飞牛IP:8088/?autorun=update&container=clash&dry=1   预览更新流程（强制演练，URL 无法触发真实更新）
 http://飞牛IP:8088/?autorefresh=300              把自动刷新间隔改成 300 秒（默认 60，范围 5~3600）
 http://飞牛IP:8088/?autocheck=0                  关掉「打开页面自动检测」（默认 600 秒一次）
+http://飞牛IP:8088/#images                       直接落在某个页面（overview/containers/images/
+                                                 networks/compose/schedules/history/audit）
 ```
 
 ---
@@ -506,6 +523,36 @@ http://飞牛IP:8088/?autocheck=0                  关掉「打开页面自动�
 
 > 直连 IP、走 HTTP 的场景下，cookie 不带 `Secure` 标志（带了就不会发送）。
 > 要更强保障，就在前面套一层 HTTPS 反向代理。
+
+---
+
+## 管理接口（本工具自己的 HTTP API）
+
+除了页面，所有能力都能用 `curl` 调（脚本、CI、快捷键都能用）。开了 `AUTH_USER` / `AUTH_PASS` 时，
+用 `-u 账号:密码` 走 Basic，或先 `POST /api/login` 拿会话 cookie。
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| GET | `/api/overview` | 容器（含 repo/tag、CPU、内存、上游状态）、镜像数、磁盘、最近任务与检测结果 |
+| GET | `/api/stats` | 各容器实时 CPU / 内存 / 上下行（并发聚合） |
+| GET | `/api/containers/<name>` | 容器详情（配置 + inspect + 实时资源） |
+| GET | `/api/containers/<name>/logs?minutes=30` | 容器日志 |
+| POST | `/api/containers/action` | `{name, action}`：`start` / `stop` / `restart` / `delete` |
+| POST | `/api/containers/create` | 新建容器（`name` / `image` / `tag` / `ipaddr` / `ports` / `mounts` / `env` / `cmd` …） |
+| GET | `/api/images` | 本地镜像（含被哪些容器占用） |
+| GET | `/api/images/search?keyword=nginx&page=1` | 爱快在线搜索 |
+| POST | `/api/images/pull` · `/api/images/delete` | `{repo, tag}`：拉取 / 删除（被占用会拒绝） |
+| GET/POST | `/api/networks` | 列表 / `{action: add\|delete, …}` |
+| GET | `/api/compose` · `/api/compose/<id>/logs` | Compose 项目列表 / 项目日志 |
+| POST | `/api/compose/action` · `/api/compose/create` | `{id, action}`：`up` / `down` / `restart` / `clean`；新建项目 |
+| GET | `/api/server/disks` · `/api/audit?limit=100` | Docker 磁盘 / 操作审计 |
+| POST | `/api/server/mirrors` · `/api/server/action` | 写镜像加速源 / Docker 服务启停 |
+| POST | `/api/check` · `/api/update` | 起一个检测 / 更新任务，返回 `job_id` |
+| GET | `/api/jobs/<id>/stream` | 该任务的 SSE 事件流（`snapshot` / `step` / `log` / `done`） |
+| GET/POST | `/api/settings` · `/api/schedules` | 下载超时与通知模式 / 定时任务增删改查 |
+
+> 写接口一律「先做、再回读、最后返回真实状态」；被爱快拒绝或回读对不上会返回 `4xx/5xx` 加原因，
+> 不会只回一句 `Success`。
 
 ---
 
@@ -559,6 +606,20 @@ BASE_IMAGE=docker.1ms.run/library/python:3.13-alpine
 
 **页面能开，但提示「未配置 IKUAI_URL」**
 环境变量没生效。检查 `.env` 是否和 `docker-compose.yml` 在同一目录、变量名是否全大写；改完要 `docker compose up -d` 重建容器（不是 restart）。
+
+**镜像页报 `(img.containers || []).map is not a function`**
+1.6.0 早期版本的问题，已修。成因：爱快对**没有任何容器在用**的镜像返回 `containers: {}`（空对象，不是空数组），
+前端当数组用就崩了。现在后端统一归一成 `[]`，前端也加了兜底。升级到最新镜像即可。
+
+**面板突然全部「读取失败」，日志里是 401 + nginx 页面**
+先看 `IKUAI_URL` 有没有带 `http://` 前缀。爱快对 http 的 `/Action/login` 会 302 到 https，
+跟随跳转时 POST 会被降级成 GET，于是拿回 401 —— 看着像密码错，其实是协议不对。
+1.6.0 起 `login()` 遇到 401/403 会自动换成 https 再试一次；`IKUAI_URL` 只写 IP 也行。
+
+**历史 / 定时任务 / 上次检测结果突然全没了**
+八成是挂载路径的问题：`./data` 是按「执行 compose 的那台机器」解析的，从别的机器或容器里跑
+`docker compose up -d`，Docker 会在宿主机上新建一个空目录挂进去。把挂载改成宿主机绝对路径
+（如 `/vol1/1000/docker/idocker/data:/data`）再重建容器，原来的数据就回来了。
 
 **容器列表读不到 / 报连不上**
 多半是飞牛到爱快网络不通。在飞牛上执行 `curl -k https://192.168.123.1` 试一下。若飞牛和爱快不在同一网段，需要先在路由器上放行。
@@ -622,14 +683,14 @@ BASE_IMAGE=docker.1ms.run/library/python:3.13-alpine
 push / PR
    │
    ▼
-① test    后端 110 项 + 前端 24 + 36 项回归（假爱快 + DOM 桩，零依赖，不装 pip 包）
+① test    后端 313 项 + 前端 24 + 56 项回归（假爱快 + DOM 桩，零依赖，不装 pip 包）
    │       ✗ 挂 → 到此为止，不产出镜像
    ▼ ✓
 ② build   构建镜像并推到 ghcr.io/utterliar1/idocker
    │       PR 不推，只构建；main 推 latest + sha-xxxxxxx；打 v* tag 推语义版本
    ▼
 ③ smoke   把刚推上去的镜像真拉下来起容器：探活 /api/health、首页与静态资源、
-          页面关键控件（概览条 / 一键更新 / 确认框 / 轻提示）与深色主题样式都在、
+          页面关键控件（侧栏 / 概览卡 / 容器表 / 抽屉 / 确认框 / 轻提示）与深色主题样式都在、
           容器自带 healthcheck.py、确认以非 root（appuser）运行，
           再单独起一个开了访问认证的容器验证登录页与会话 cookie 全链路
 ```
@@ -641,8 +702,8 @@ push / PR
 发新版本就是打个 tag：
 
 ```bash
-git tag v1.5.2 && git push origin v1.5.2
-# → ghcr.io/utterliar1/idocker:1.5.2 / :1.5 / :latest / :sha-xxxxxxx
+git tag v1.6.0 && git push origin v1.6.0
+# → ghcr.io/utterliar1/idocker:1.6.0 / :1.6 / :latest / :sha-xxxxxxx
 ```
 
 推送 ghcr.io 用的是仓库自带的 `GITHUB_TOKEN`（workflow 里声明了 `packages: write`），
@@ -710,7 +771,7 @@ python fnos_ssh.py --put webapp/Dockerfile /vol1/1000/docker/idocker/Dockerfile
 同仓库上一层的 `_test/` 是本地回归测试，不参与镜像构建，改代码后可以先跑一遍再上机：
 
 ```bash
-python _test/test_webapp.py          # 后端 307 项：假爱快 + 端到端断言
+python _test/test_webapp.py          # 后端 313 项：假爱快 + 端到端断言
                                      #   （调度触发、超时跳过、幂等跳过、并发保护、加速源同源、
                                      #     tag 预检、管理台启停/创建/删除、审计脱敏等）
 node _test/test_frontend.js          # 前端 24 项：自动刷新的时序行为
