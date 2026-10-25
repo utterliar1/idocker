@@ -41,4 +41,4 @@ The frontend timing suite must run with ?autocheck=0 in its test setup. Tests th
 
 ## Release and Deployment
 
-Before release, run all three regression suites, keep the version in webapp/app/server.py and the image tag in webapp/docker-compose.yml aligned, and wait for CI test/build/smoke jobs to pass before deploying. Do not deploy to the router or NAS unless the user asks for deployment. Verify the existing data volume is reused after any deployment.
+Before release, run all three regression suites, keep the version in webapp/app/server.py and the image tag in webapp/docker-compose.yml aligned, and wait for CI test/build/smoke jobs to pass before deploying. When the deploy is driven from outside the NAS (another host or container), the bind mount must use the absolute host path (/vol1/1000/docker/idocker/data) — a relative ./data is resolved on the machine running compose and the daemon will silently create an empty root-owned directory, which loses history/settings/state and is not even writable by the non-root app user. Do not deploy to the router or NAS unless the user asks for deployment. Verify the existing data volume is reused after any deployment.

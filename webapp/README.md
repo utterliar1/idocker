@@ -11,19 +11,23 @@
 
 ## 界面预览
 
-容器总览（含上游版本状态、本地镜像时间）：
+概览：容器 / 镜像 / 可更新 / 磁盘四张卡，下面是资源占用 TOP 与最近任务、最近操作。
 
-![容器总览](screenshots/01-容器总览.png)
+![概览](screenshots/01-概览.png)
 
-六步执行流程（左侧流程图实时点亮，右侧实时日志）：
+容器：带 CPU、内存、上游版本状态，行内直接启停 / 重启 / 日志 / 详情 / 版本 / 更新 / 删除。
 
-![六步执行流程](screenshots/02-六步执行流程.png)
+![容器](screenshots/02-容器.png)
 
-版本检测（三步流程，不碰路由器）：
+镜像：本地镜像的大小、拉取时间、被谁占用；下面是爱快在线搜索，搜到直接拉。
 
-![版本检测](screenshots/03-版本检测.png)
+![镜像](screenshots/03-镜像.png)
 
-> 以上截图取自**实际部署在飞牛（fnOS）上的容器**，不是本地开发环境。
+执行面板：左侧流程图实时点亮，右侧实时日志（版本检测走三步，更新走六步）。
+
+![版本检测](screenshots/04-版本检测.png)
+
+> 以上截图取自**实际部署在飞牛（fnOS）上的容器**，操作的是路由器上真实的 7 个容器，不是本地开发环境。
 
 ---
 
@@ -698,6 +702,8 @@ webapp/
 python fnos_ssh.py "docker compose ps"
 python fnos_ssh.py --put webapp/Dockerfile /vol1/1000/docker/idocker/Dockerfile
 ```
+
+⚠️ 如果 compose 不是在飞牛本机的部署目录里执行（比如在另一台机器、另一个容器里跑），`./data` 会按**执行 compose 的那台机器**解析，Docker 会在宿主机上新建一个空的 root 目录挂进去 —— 历史、定时任务、上次检测结果全没了，容器里的非 root 用户还写不进去。这种情况下请把挂载写成宿主机绝对路径 `/vol1/1000/docker/idocker/data:/data`。
 
 数据卷 `/data` 存放：`settings.json`（下载超时 + 定时任务）、`state.json`（digest 基准）、`last_check.json`（上次检测结果）、`history.json`（执行历史）。都是可再生的元数据，删掉只会丢历史和定时任务配置。
 
