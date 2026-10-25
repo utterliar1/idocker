@@ -2203,5 +2203,8 @@
     try { autorun(); } catch (e) {}
     loadAudit(true);
     loadDisk();
+    // 直接落在 #images / #networks 这类页面时，首屏那次 goPage 因为还没拿到
+    // 容器数据会跳过取数，这里补一次，否则页面永远停在「加载中…」。
+    if (state.page !== "overview") refreshPage(state.page);
   });
 })();
