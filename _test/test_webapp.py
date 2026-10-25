@@ -1616,6 +1616,135 @@ ok("「拉取新镜像」步骤标 failed", step_states(_j45).get("pull") == "fa
    step_states(_j45))
 mock_router.FAKE.missing_tags = set()
 
+print("\n=== 46. 管理台：容器详情 / 启停 / 创建 / 删除 ===")
+_d46, _c46 = req("/api/containers/clash")
+ok("GET /api/containers/<name> 正常", _c46 == 200 and _d46["ok"], _d46)
+_v46 = _d46["data"]
+ok("详情里有容器/配置/实时资源",
+   bool(_v46.get("container")) and "inspect" in _v46 and "stats" in _v46, list(_v46))
+ok("实时资源解析出 cpu", (_v46.get("stats") or {}).get("cpu_used") == "1.23%",
+   _v46.get("stats"))
+ok("详情把 image 拆成 repo / tag（上游状态要靠它做键）",
+   _v46["container"].get("repo") == "dreamacro/clash"
+   and _v46["container"].get("tag") == "latest", _v46["container"].get("image"))
+
+_d46b, _c46b = req("/api/containers/clash/logs?minutes=30")
+ok("GET 容器日志正常", _c46b == 200 and isinstance(_d46b.get("data"), list), _d46b)
+
+# 列表页的 CPU/内存：爱快没有批量接口，得自己并发聚合
+_d46s, _c46s = req("/api/stats")
+ok("GET /api/stats 正常", _c46s == 200 and _d46s.get("ok"), _d46s)
+_s46 = _d46s.get("data") or {}
+ok("批量资源覆盖所有容器",
+   sorted(_s46) == sorted(c["name"] for c in mock_router.FAKE.containers), sorted(_s46))
+ok("批量资源解析出 cpu / 内存字节数",
+   (_s46.get("clash") or {}).get("cpu") == "1.23%"
+   and (_s46.get("clash") or {}).get("mem") == 123456789,
+   _s46.get("clash"))
+
+_d46c, _ = req("/api/containers/action", {"name": "clash", "action": "stop"})
+ok("停止容器：接口成功", (_d46c.get("data") or {}).get("ok") is True, _d46c)
+_state = {c["name"]: c for c in mock_router.FAKE.containers}["clash"]["state"]
+ok("停止后状态真的变成 exited（回读确认）", _state == "exited", _state)
+_d46d, _ = req("/api/containers/action", {"name": "clash", "action": "start"})
+ok("启动容器：回读为 running",
+   (_d46d.get("data") or {}).get("ok") is True
+   and {c["name"]: c for c in mock_router.FAKE.containers}["clash"]["state"] == "running",
+   _d46d)
+_d46e, _ = req("/api/containers/action", {"name": "clash", "action": "restart"})
+ok("重启容器：接口成功且仍在运行", (_d46e.get("data") or {}).get("ok") is True, _d46e)
+
+# 新建 → 出现在列表 → 删除 → 消失
+mock_router.FAKE.add_calls.clear()
+_d46f, _c46f = req("/api/containers/create", {
+    "name": "mgmt-demo", "image": "library/nginx", "tag": "1.27",
+    "interface": "doc_docker", "ipaddr": "192.168.3.20",
+    "env": "TZ=Asia/Shanghai,API_TOKEN=supersecret",
+    "mounts": "/docker/ikuai/demo:/data", "ports": "8081:80/tcp",
+    "memory": 268435456, "auto_start": 1})
+ok("新建容器成功", _c46f == 200 and _d46f["ok"], _d46f)
+ok("下发的是 repo:tag 全名", mock_router.FAKE.add_calls
+   and mock_router.FAKE.add_calls[-1]["image"] == "library/nginx:1.27",
+   mock_router.FAKE.add_calls[-1] if mock_router.FAKE.add_calls else None)
+ok("容器出现在列表里",
+   any(c["name"] == "mgmt-demo" for c in mock_router.FAKE.containers))
+_d46g, _c46g = req("/api/containers/create", {"name": "mgmt-demo", "image": "library/nginx"})
+ok("重名创建被拒（400）", _c46g == 400, _c46g)
+_d46h, _c46h = req("/api/containers/create", {"name": "x", "image": "library/nginx:1.27"})
+ok("镜像字段带 tag 时给出明确报错", _c46h == 400 and "tag" in _d46h.get("error", ""), _d46h)
+
+_d46i, _ = req("/api/containers/action", {"name": "mgmt-demo", "action": "delete"})
+ok("删除容器：回读确认已消失",
+   (_d46i.get("data") or {}).get("ok") is True
+   and not any(c["name"] == "mgmt-demo" for c in mock_router.FAKE.containers), _d46i)
+
+print("\n=== 47. 管理台：镜像搜索 / 拉取 / 删除保护 ===")
+_d47, _c47 = req("/api/images/search?keyword=ng")
+ok("在线搜索镜像", _c47 == 200 and _d47["data"]["total"] == 1, _d47.get("data"))
+ok("搜索结果带描述与星标",
+   _d47["data"]["list"][0]["description"] and "star_count" in _d47["data"]["list"][0])
+
+_d47b, _c47b = req("/api/images/pull", {"repo": "library/nginx", "tag": "1.27"})
+ok("拉取镜像：返回状态", _c47b == 200 and _d47b["data"]["state"] in
+   ("done", "exists", "queued"), _d47b)
+
+# 被容器占用的镜像必须拒绝删除（这是真机事故换来的安全阀）
+_d47c, _c47c = req("/api/images/delete", {"repo": "dreamacro/clash", "tag": "latest"})
+ok("被容器占用的镜像拒绝删除（409）", _c47c == 409, (_c47c, _d47c))
+ok("拒绝理由点明占用者", "clash" in str(_d47c.get("error")), _d47c)
+
+print("\n=== 48. 管理台：网络 / 编排 / 服务设置 ===")
+_d48, _c48 = req("/api/networks")
+ok("网络列表", _c48 == 200 and _d48["data"][0]["name"] == "doc_docker", _d48.get("data"))
+_d48b, _c48b = req("/api/networks", {"action": "add", "name": "lab_net",
+                                     "subnet": "172.30.0.0/24", "gateway": "172.30.0.1"})
+ok("新建网络并回读", _c48b == 200 and _d48b["data"]["name"] == "lab_net", _d48b)
+_nid = _d48b["data"]["id"]
+_d48c, _c48c = req("/api/networks", {"action": "delete", "id": _nid})
+ok("删除网络并回读确认", _c48c == 200
+   and not any(n["id"] == _nid for n in mock_router.FAKE.networks), _d48c)
+
+_d48d, _c48d = req("/api/compose")
+ok("编排列表为空时也正常", _c48d == 200 and _d48d["data"] == [], _d48d)
+_d48e, _c48e = req("/api/compose/create", {"tagname": "lab", "content": "services:\n  web:\n    image: nginx\n"})
+ok("新建编排项目", _c48e == 200 and _d48e["data"]["tagname"] == "lab", _d48e)
+_d48f, _c48f = req("/api/compose/create", {"content": "services: {}"})
+ok("缺项目名被拒（400）", _c48f == 400, _d48f)
+_d48g, _ = req("/api/compose/action", {"id": "1", "action": "up"})
+ok("编排 up 下发成功", (_d48g.get("data") or {}).get("ok") is True
+   and ("up", "1") in mock_router.FAKE.compose_calls, mock_router.FAKE.compose_calls)
+_d48h, _c48h = req("/api/compose/action", {"id": "1", "action": "explode"})
+ok("非法编排动作被拒（400）", _c48h == 400, _d48h)
+
+_d48i, _c48i = req("/api/server/disks")
+ok("磁盘信息", _c48i == 200 and _d48i["data"][0]["f_name"] == "docker", _d48i)
+_d48j, _c48j = req("/api/server/mirrors",
+                   {"mirrors": ["https://docker.1ms.run", "https://hub.rat.dev"]})
+ok("保存加速源并回读", _c48j == 200
+   and _d48j["data"]["mirrors"] == ["https://docker.1ms.run", "https://hub.rat.dev"],
+   _d48j)
+ok("save 是全量覆盖（工作盘等字段被原样回填）",
+   mock_router.FAKE.server_saved
+   and mock_router.FAKE.server_saved[-1]["workdisk"] == "docker",
+   mock_router.FAKE.server_saved[-1] if mock_router.FAKE.server_saved else None)
+
+print("\n=== 49. 审计：动作留痕、失败也记、凭据打码 ===")
+_d49, _c49 = req("/api/audit?limit=100")
+_rows = _d49.get("data") or []
+ok("审计有记录", _c49 == 200 and len(_rows) > 0, len(_rows))
+_actions = {r.get("action") for r in _rows}
+ok("记下了容器启停/创建/删除",
+   {"container.stop", "container.start", "container.create", "container.delete"} <= _actions,
+   sorted(_actions))
+ok("记下了网络与编排动作", {"network.add", "compose.up"} <= _actions, sorted(_actions))
+_deny = [r for r in _rows if r.get("action") == "image.delete" and r.get("ok") is False]
+ok("被拒绝的删除也留痕（ok=false）", bool(_deny), [r.get("detail") for r in _rows][:3])
+_created = [r for r in _rows if r.get("action") == "container.create" and r.get("ok")]
+ok("审计里的环境变量被打码（不留 token）",
+   _created and "supersecret" not in json.dumps(_created[0], ensure_ascii=False),
+   _created[0].get("params") if _created else None)
+ok("审计带时间与目标", _rows[0].get("at") and "target" in _rows[0], _rows[0])
+
 # ---- 收尾：把还在跑的任务等完、把两个 HTTP 服务关掉再退出 ----
 # 否则守护线程会在解释器最终化时被硬杀，容易在退出阶段炸掉（CI 上实测 exit 139，
 # 而 131 项断言其实全过了 —— 问题出在收尾，不是测试本身）。

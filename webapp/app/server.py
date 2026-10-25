@@ -47,13 +47,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(HERE, "static")
 
 sys.path.insert(0, HERE)
+import audit as AU             # noqa: E402
+import docker_ops as D        # noqa: E402
 import ikuai_api as A          # noqa: E402
 import jobs as J               # noqa: E402
 import notify as N             # noqa: E402
 import scheduler as SC         # noqa: E402
 import store as S              # noqa: E402
 
-VERSION = "1.5.4"
+VERSION = "1.6.0"
 CFG = A.load_config()
 MANAGER = J.JobManager(CFG)
 # 持久化设置：页面里改的下载超时、定时任务、通知时机都落在这里（Docker 卷 /data）
@@ -80,6 +82,9 @@ def _on_job_finish(job):
 
 
 MANAGER.set_on_finish(_on_job_finish)
+
+# 管理动作的审计流水（/data/audit.json）
+AUDIT = AU.Audit(os.path.join(CFG.get("data_dir") or "/data", "audit.json"))
 
 MIME = {
     ".html": "text/html; charset=utf-8",
@@ -400,6 +405,30 @@ class Handler(BaseHTTPRequestHandler):
         return host == (self.headers.get("Host") or "").strip()
 
     # -- 认证相关的响应工具 ----------------------------------------
+    def _user(self):
+        """当前登录用户名（用于审计）。没开认证时返回空串。"""
+        try:
+            token = parse_cookies(self.headers.get("Cookie")).get(COOKIE_NAME)
+            return read_session_token(token) or ""
+        except Exception:                                       # noqa: BLE001
+            return ""
+
+    def _audited(self, action, target, params, fn):
+        """执行一次管理动作并记账。
+
+        失败也要记：管理台里「点了删除但被拒绝」本身就是需要留痕的事件。
+        """
+        try:
+            result = with_client(fn)
+        except (D.OpError, A.IKuaiError) as e:
+            AUDIT.add(action, target, str(e), ok=False, params=params, user=self._user())
+            raise
+        ok, detail = True, "成功"
+        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], bool):
+            ok, detail = result
+        AUDIT.add(action, target, detail, ok=ok, params=params, user=self._user())
+        return result
+
     def _send_html(self, body, status=200):
         raw = body.encode("utf-8")
         self.send_response(status)
@@ -596,6 +625,63 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True, "data": self._overview()})
             if path == "/api/containers":
                 return self._send_json({"ok": True, "data": with_client(lambda ik: A.get_containers(ik))})
+
+            # ---------- 管理台：容器详情 / 日志 ----------
+            m = re.fullmatch(r"/api/containers/([^/]+)/logs", path)
+            if m:
+                name = urllib.parse.unquote(m.group(1))
+                try:
+                    minutes = int((query.get("minutes") or ["10"])[0])
+                except (TypeError, ValueError):
+                    minutes = 10
+                lines = with_client(lambda ik: D.container_logs(ik, name, minutes=minutes))
+                return self._send_json({"ok": True, "data": lines})
+            m = re.fullmatch(r"/api/containers/([^/]+)", path)
+            if m:
+                name = urllib.parse.unquote(m.group(1))
+                return self._send_json({"ok": True,
+                                        "data": with_client(lambda ik: D.container_detail(ik, name))})
+
+            # ---------- 管理台：镜像在线搜索 ----------
+            if path == "/api/images/search":
+                kw = (query.get("keyword") or [""])[0]
+                page = (query.get("page") or ["1"])[0]
+                try:
+                    page = max(1, int(page))
+                except (TypeError, ValueError):
+                    page = 1
+                return self._send_json({"ok": True,
+                                        "data": with_client(lambda ik: D.image_search(ik, kw, page=page))})
+
+            # ---------- 管理台：网络 / 编排 / 磁盘 / 审计 ----------
+            if path == "/api/networks":
+                return self._send_json({"ok": True,
+                                        "data": with_client(lambda ik: D.networks(ik))})
+            if path == "/api/compose":
+                return self._send_json({"ok": True,
+                                        "data": with_client(lambda ik: D.compose_list(ik))})
+            m = re.fullmatch(r"/api/compose/([0-9A-Za-z_-]+)/logs", path)
+            if m:
+                cid = m.group(1)
+                return self._send_json({"ok": True,
+                                        "data": with_client(lambda ik: D.compose_logs(ik, cid))})
+            m = re.fullmatch(r"/api/compose/([0-9A-Za-z_-]+)", path)
+            if m:
+                cid = m.group(1)
+                return self._send_json({"ok": True,
+                                        "data": with_client(lambda ik: D.compose_details(ik, cid))})
+            if path == "/api/server/disks":
+                return self._send_json({"ok": True,
+                                        "data": with_client(lambda ik: D.server_disks(ik))})
+            if path == "/api/stats":
+                return self._send_json({"ok": True,
+                                        "data": with_client(lambda ik: D.stats_all(ik))})
+            if path == "/api/audit":
+                try:
+                    limit = int((query.get("limit") or ["50"])[0])
+                except (TypeError, ValueError):
+                    limit = 50
+                return self._send_json({"ok": True, "data": AUDIT.recent(max(1, min(limit, 300)))})
             if path == "/api/images":
                 return self._send_json({"ok": True, "data": with_client(lambda ik: A.get_local_images(ik))})
             if path == "/api/server":
@@ -645,6 +731,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error_json("未知接口 %s" % path, 404)
         except ApiError as e:
             self._send_error_json(e.message, e.status)
+        except D.OpError as e:
+            # 管理操作里的业务拒绝（重名、字段不合法、目标不存在）都是 400
+            self._send_error_json(str(e), 400)
         except A.IKuaiError as e:
             self._send_error_json(str(e), 502)
         except Exception as e:                                  # noqa: BLE001
@@ -661,7 +750,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._csrf_ok():
             return self._send_error_json("跨站请求被拒绝", 403)
         try:
-            body = self._read_json_body()
+            body = self._read_json_body() or {}
             if path == "/api/check":
                 job = MANAGER.create("check", [])
                 return self._send_json({"ok": True, "job_id": job.id})
@@ -681,6 +770,91 @@ class Handler(BaseHTTPRequestHandler):
                 except J.BusyError as e:
                     raise ApiError(str(e), 409)
                 return self._send_json({"ok": True, "job_id": job.id})
+            # ---------- 管理台写操作（全部走审计）----------
+            if path == "/api/containers/action":
+                name = str(body.get("name") or "").strip()
+                action = str(body.get("action") or "").strip().lower()
+                if not name:
+                    raise ApiError("缺少容器名")
+                ok, detail = self._audited("container." + action, name, body,
+                                           lambda ik: D.container_action(ik, name, action))
+                return self._send_json({"ok": True, "data": {"ok": ok, "detail": detail}})
+
+            if path == "/api/containers/create":
+                form = body.get("form") if isinstance(body.get("form"), dict) else body
+                payload = self._audited("container.create", str(form.get("name") or ""), form,
+                                        lambda ik: D.container_create(ik, form))
+                return self._send_json({"ok": True, "data": payload})
+
+            if path == "/api/images/pull":
+                repo = str(body.get("repo") or "").strip()
+                tag = str(body.get("tag") or "latest").strip() or "latest"
+                if not repo:
+                    raise ApiError("缺少镜像名")
+                res = self._audited("image.pull", "%s:%s" % (repo, tag), body,
+                                    lambda ik: D.image_pull(ik, repo, tag))
+                return self._send_json({"ok": True, "data": res})
+
+            if path == "/api/images/delete":
+                repo = str(body.get("repo") or "").strip()
+                tag = str(body.get("tag") or "").strip() or "latest"
+                if not repo:
+                    raise ApiError("缺少镜像名")
+                ok, detail = self._audited("image.delete", "%s:%s" % (repo, tag), body,
+                                           lambda ik: D.image_delete(ik, repo, tag))
+                if not ok:
+                    # 占用保护/回读不符都走 409：前端原样展示 detail
+                    raise ApiError(detail, 409)
+                return self._send_json({"ok": True, "data": {"detail": detail}})
+
+            if path == "/api/networks":
+                action = str(body.get("action") or "add").strip().lower()
+                if action == "add":
+                    net = self._audited("network.add", str(body.get("name") or ""), body,
+                                        lambda ik: D.network_add(ik, body))
+                    return self._send_json({"ok": True, "data": net})
+                if action == "delete":
+                    nid = str(body.get("id") or "").strip()
+                    if not nid:
+                        raise ApiError("缺少网络 id")
+                    gone = self._audited("network.delete", nid, body,
+                                         lambda ik: D.network_delete(ik, nid))
+                    if not gone:
+                        raise ApiError("爱快回了成功，但网络仍在 —— 请到爱快后台确认", 409)
+                    return self._send_json({"ok": True, "data": {"ok": True}})
+                raise ApiError("未知操作 %s" % action)
+
+            if path == "/api/compose/action":
+                cid = str(body.get("id") or "").strip()
+                action = str(body.get("action") or "").strip().lower()
+                if not cid:
+                    raise ApiError("缺少编排项目 id")
+                ok, detail = self._audited("compose." + action, cid, body,
+                                           lambda ik: D.compose_action(ik, cid, action))
+                return self._send_json({"ok": True, "data": {"ok": ok, "detail": detail}})
+
+            if path == "/api/compose/create":
+                form = body.get("form") if isinstance(body.get("form"), dict) else body
+                target = str(form.get("tagname") or form.get("name") or "")
+                item = self._audited("compose.create", target,
+                                     {"tagname": target, "content_len": len(str(form.get("content") or ""))},
+                                     lambda ik: D.compose_create(ik, form))
+                return self._send_json({"ok": True, "data": item})
+
+            if path == "/api/server/mirrors":
+                mirrors = body.get("mirrors")
+                if not isinstance(mirrors, list):
+                    raise ApiError("mirrors 必须是数组")
+                saved = self._audited("server.mirrors", "mirrors", {"mirrors": mirrors},
+                                      lambda ik: D.save_mirrors(ik, mirrors))
+                return self._send_json({"ok": True, "data": {"mirrors": saved}})
+
+            if path == "/api/server/action":
+                action = str(body.get("action") or "").strip().lower()
+                ok, detail = self._audited("server." + action, "docker-service", body,
+                                           lambda ik: D.service_action(ik, action))
+                return self._send_json({"ok": True, "data": {"ok": ok, "detail": detail}})
+
             if path == "/api/settings":
                 if body.get("pull_timeout") is not None:
                     CFG["pull_timeout"] = STORE.set_pull_timeout(body.get("pull_timeout"))
@@ -695,6 +869,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error_json("未知接口 %s" % path, 404)
         except ApiError as e:
             self._send_error_json(e.message, e.status)
+        except D.OpError as e:
+            self._send_error_json(str(e), 400)
+        except A.IKuaiError as e:
+            self._send_error_json(str(e), 502)
         except Exception as e:                                  # noqa: BLE001
             self._send_error_json("%s: %s" % (type(e).__name__, e), 500)
 

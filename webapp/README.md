@@ -1,11 +1,11 @@
-# 爱快 Docker 容器更新器 · Web 版
+# idocker · 爱快 Docker 管理台
 
 [![ci](https://github.com/utterliar1/idocker/actions/workflows/ci.yml/badge.svg)](https://github.com/utterliar1/idocker/actions/workflows/ci.yml)
 [![ghcr](https://img.shields.io/badge/ghcr.io-utterliar1%2Fidocker-blue)](https://github.com/utterliar1/idocker/pkgs/container/idocker)
 
-把 [爱快（iKuai）](https://www.ikuai8.com/) 路由器上的 Docker 容器更新，做成一个带**可视化执行流程**的网页应用，跑在**飞牛 NAS（fnOS）**的 Docker 里。
+把 [爱快（iKuai）](https://www.ikuai8.com/) 路由器上的 Docker **管起来**：容器、镜像、网络、Compose、服务设置、定时任务、操作审计，一个网页全包，跑在**飞牛 NAS（fnOS）**的 Docker 里。核心的更新流程保留**六步可视化执行 + 实时日志**。
 
-打开网页 → **概览条直接告诉你有没有要更新的、有几个** → 点「更新这 N 个」→ 确认后六步执行流程实时点亮 + 日志滚动 → 完成。
+打开网页 → 概览直接告诉你有没有要更新的、有几个 → 点「更新这 N 个」→ 确认后六步流程实时点亮 → 完成。日常管理走左侧导航，任何写操作都先弹预览、执行后自动回读确认。
 
 > 镜像地址：`ghcr.io/utterliar1/idocker`，容器名 `idocker`。改一行配置就能用，见下方**方式 A**。
 
@@ -24,6 +24,31 @@
 ![版本检测](screenshots/03-版本检测.png)
 
 > 以上截图取自**实际部署在飞牛（fnOS）上的容器**，不是本地开发环境。
+
+---
+
+## v1.6.0：从「更新器」变成「管理台」
+
+界面整体重做（浅色、单强调色、表格化），并从只做更新扩到**日常管理**：
+
+| 页面 | 能做什么 |
+|---|---|
+| **概览** | 容器/镜像/可更新/磁盘四张卡；资源占用 TOP（CPU、内存）；最近任务、最近操作 |
+| **容器** | 列表带 CPU / 内存 / 上游状态；搜索与筛选；启动 / 停止 / 重启 / 日志 / 详情 / 版本 / 更新 / 删除；新建容器 |
+| **镜像** | 本地镜像（大小、拉取时间、被谁使用）；在线搜索直接拉取；被容器占用的镜像拒绝删除 |
+| **网络** | 列出子网 / 网关 / 成员；新建；还有容器在用就不能删 |
+| **编排** | Compose 项目列表、启动 / 停止 / 重启 / 清理、项目日志、新建项目 |
+| **定时任务** | 每 N 分钟或每天定点；仅检测 / 检测到新版就更新；指定目标容器 |
+| **执行历史** | 每次执行的成功/失败、每步耗时、完整日志 |
+| **操作审计** | 所有手动管理动作留痕（含失败），**凭据字段自动打码** |
+
+配套的三条硬规则：
+
+1. **写操作一定回读**——爱快写接口是异步的，`update` / `add` 甚至返回空 body，「回 Success」不等于生效，所以每个动作之后都要重新读一遍状态才算成功；
+2. **危险操作先预览**——删除容器、清理编排、删除网络都会列出到底动谁、会中断什么；
+3. **凭据不出容器**——审计里 `env`、密码类字段统一 `***`，通知渠道的完整 URL / token 不下发浏览器。
+
+爱快 4.0 的接口边界（实测）：容器/镜像/网络/Compose/服务设置五块完整；**没有** exec 终端、volume 管理、prune、历史监控曲线、健康详情与事件流。
 
 ---
 
@@ -642,6 +667,9 @@ webapp/
     ├── server.py           HTTP 服务 + 路由 + SSE（纯标准库）
     ├── ikuai_api.py        爱快 4.0 API 客户端 + LocalImages 镜像索引
     ├── jobs.py             任务引擎：六步流程 + 事件流 + 历史持久化
+    ├── docker_ops.py       管理操作层：容器/镜像/网络/Compose/服务设置 + 回读确认
+    ├── audit.py            操作审计与参数脱敏（/data/audit.json）
+    ├── notify.py           任务结束通知（通用 webhook / PushPlus）
     ├── scheduler.py        定时调度器（后台线程，15 秒一次 tick）
     ├── store.py            设置与定时任务的持久化（/data/settings.json）
     ├── healthcheck.py      健康检查（开认证后 401 也算存活）
@@ -676,10 +704,11 @@ python fnos_ssh.py --put webapp/Dockerfile /vol1/1000/docker/idocker/Dockerfile
 同仓库上一层的 `_test/` 是本地回归测试，不参与镜像构建，改代码后可以先跑一遍再上机：
 
 ```bash
-python _test/test_webapp.py          # 后端 110 项：假爱快 + 端到端断言
-                                     #   （调度触发、超时跳过、幂等跳过、并发保护、加速源同源、历史日志等）
+python _test/test_webapp.py          # 后端 307 项：假爱快 + 端到端断言
+                                     #   （调度触发、超时跳过、幂等跳过、并发保护、加速源同源、
+                                     #     tag 预检、管理台启停/创建/删除、审计脱敏等）
 node _test/test_frontend.js          # 前端 24 项：自动刷新的时序行为
-node _test/test_frontend_ux.js       # 前端 36 项：概览条 / 确认框 / 自动检测 / 轻提示
+node _test/test_frontend_ux.js       # 前端 56 项：概览条 / 确认框 / 自动检测 / 轻提示
                                      #   （自动刷新开关/暂停、倒计时、静默刷新不重绘、后台顺延、任务期间让路）
 ```
 

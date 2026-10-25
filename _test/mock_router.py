@@ -95,6 +95,24 @@ class Fake(object):
         # 上游**不存在**的 tag（"repo:tag"）。真 registry 回 404，而爱快对这种情况
         # 不报错，只会下发一个永不完成的下载任务 —— 正是「白等 600 秒超时」的来源。
         self.missing_tags = set()
+        # ---- 管理台相关（容器增删、网络、编排、在线搜索）----
+        self.networks = [{"id": "net-doc", "name": "doc_docker", "subnet": "192.168.3.0/24",
+                          "gateway": "192.168.3.1", "subnet6": "", "gateway6": "",
+                          "comment": "", "containers": ["clash", "vaultwarden"]}]
+        self.compose = []
+        self.compose_calls = []
+        self.add_calls = []
+        self.del_container_calls = []
+        self.server_saved = []
+        self.image_search_list = [
+            {"id": 1, "name": "nginx", "namespace": "library", "registry": "docker.io",
+             "repository_name": "library/nginx", "pull_count": 100, "star_count": 5,
+             "description": "Official build of Nginx.", "is_official": True},
+            {"id": 2, "name": "redis", "namespace": "library", "registry": "docker.io",
+             "repository_name": "library/redis", "pull_count": 90, "star_count": 4,
+             "description": "Redis is an open source key-value store.",
+             "is_official": True},
+        ]
         # 爱快自己那个「可用版本」接口返回什么（None 表示恒为空，实测 mihomo 就是）
         self.ikuai_tags = ["latest", "1.7.2", "1.8.0"]
         self.del_calls = []
@@ -160,6 +178,10 @@ class Fake(object):
                     return {"code": 0, "results": {"inspect": [{"memory": 0, "cpushares": 0}]}}
                 if param.get("TYPE") == "log":
                     return {"code": 0, "results": {"log": list(self.container_logs)}}
+                if param.get("TYPE") == "source_used":
+                    return {"code": 0, "results": {"source_used": {
+                        "cpu_used": "1.23%", "memused": 123456789,
+                        "down_speed": 1024, "up_speed": 2048}}}
                 return {"code": 0, "results": {"data": self.containers}}
             if action == "update":
                 self.update_calls.append(param)
@@ -187,12 +209,53 @@ class Fake(object):
                     self._attach_owner(c["name"], full)
                 return {}
             if action in ("up", "down", "restart"):
+                # 真实爱快靠 id 定位；状态要真的变，上层才能回读确认
+                for c in self.containers:
+                    if c.get("id") == param.get("id"):
+                        c["state"] = "exited" if action == "down" else "running"
+                        c["status"] = "Exited (0)" if action == "down" else "Up 1 second"
                 return {}
+            if action == "del":
+                cid = param.get("id")
+                victim = [c for c in self.containers if c.get("id") == cid]
+                self.containers = [c for c in self.containers if c.get("id") != cid]
+                self.del_container_calls.append(cid)
+                if victim:
+                    name = victim[0].get("name")
+                    for img in self.images:
+                        img["containers"] = [x for x in (img.get("containers") or [])
+                                             if x.get("name") != name]
+                    for n in self.networks:
+                        n["containers"] = [x for x in (n.get("containers") or [])
+                                           if x != name]
+                return {"code": 0, "message": "Success"}
+            if action == "add":
+                self.add_calls.append(dict(param))
+                c = {"id": "sha256:" + ("%064x" % (0xC0D000 + len(self.containers))),
+                     "name": param.get("name"), "image": param.get("image"),
+                     "state": "running" if param.get("enabled") != "no" else "exited",
+                     "status": "Up 1 second", "interface": param.get("interface") or "doc_docker",
+                     "ipaddr": param.get("ipaddr") or "192.168.3.99", "ip6addr": "",
+                     "auto_start": str(param.get("auto_start") or 0),
+                     "mounts": param.get("mounts") or "", "env": param.get("env") or "",
+                     "cmd": param.get("cmd") or "", "comment": param.get("comment") or "",
+                     "ports": [], "image_logo": ""}
+                self.containers.append(c)
+                if c["image"]:
+                    self._attach_owner(c["name"], c["image"])
+                return {"code": 0, "message": "Success"}
         if func == "docker_image":
             if action == "show":
                 if param.get("TYPE") == "tag":
                     tags = list(self.ikuai_tags or [])
                     return {"code": 0, "results": {"tag_list": tags}}
+                if param.get("TYPE") == "image":
+                    kw = str(param.get("keyword") or "").lower()
+                    rows = [x for x in self.image_search_list
+                            if not kw or kw in str(x.get("name")).lower()]
+                    return {"code": 0, "results": {"image": {
+                        "total": len(rows), "page": param.get("page") or 1,
+                        "page_size": param.get("page_size") or 24, "list": rows}}}
                 return {"code": 0, "results": {"data": self.images}}
             if action == "del":
                 # 真实爱快只认「完整 repo 名 + 真实 tag」，对不上就静默成功但什么都不删。
@@ -243,13 +306,60 @@ class Fake(object):
                                     "namespace": ns, "containers": []})
                 return {}
         if func == "docker_server":
+            if action == "save":
+                self.server_saved.append(dict(param))
+                self.mirrors = [m for m in str(param.get("mirrors") or "").split(",") if m]
+                return {"code": 0, "message": "Success"}
             if param.get("TYPE") == "overview":
                 return {"code": 0, "results": {"docker_version": "28.3.3", "status": 1}}
             if param.get("TYPE") == "data":
                 return {"code": 0, "results": {"data": [
                     {"id": 1, "enabled": "yes", "workdisk": "docker", "autostart": 1,
                      "mirrors": ",".join(self.mirrors), "comment": ""}]}}
+            if param.get("TYPE") == "disks":
+                return {"code": 0, "results": {"disks": [
+                    {"f_name": "docker", "st_size": 11087982592, "st_type": 0}]}}
             return {"code": 0, "results": {"data": [{"enabled": 1, "path": "/vol1/docker"}]}}
+        # ---- 管理台：网络 / 编排 / 在线搜索 ----
+        if func == "docker_network":
+            if action == "show":
+                return {"code": 0, "results": {"data": self.networks}}
+            if action == "add":
+                nid = "net-%d" % (len(self.networks) + 1)
+                self.networks.append({"id": nid, "name": param.get("name"),
+                                      "subnet": param.get("subnet") or "",
+                                      "gateway": param.get("gateway") or "",
+                                      "subnet6": param.get("subnet6") or "",
+                                      "gateway6": param.get("gateway6") or "",
+                                      "comment": param.get("comment") or "",
+                                      "containers": []})
+                return {"code": 0, "message": "Success"}
+            if action == "del":
+                self.networks = [n for n in self.networks if n.get("id") != param.get("id")]
+                return {"code": 0, "message": "Success"}
+        if func == "docker_compose":
+            if action == "show":
+                if param.get("TYPE") == "details":
+                    for it in self.compose:
+                        if str(it.get("id")) == str(param.get("id")):
+                            return {"code": 0, "results": {"data": it}}
+                    return {"code": 0, "results": {"data": {}}}
+                if param.get("TYPE") == "log":
+                    return {"code": 0, "results": {"log": ["compose log line 1"]}}
+                if param.get("TYPE") == "disks":
+                    return {"code": 0, "results": {"disks": [{"f_name": "docker"}]}}
+                return {"code": 0, "results": {"data": self.compose}}
+            if action == "add":
+                if not param.get("tagname"):
+                    return {"code": 3001, "message": "请求参数不合法",
+                            "errors": "参数错误: tagname"}
+                item = {"id": str(len(self.compose) + 1), "tagname": param.get("tagname"),
+                        "name": param.get("tagname"), "status": "stopped"}
+                self.compose.append(item)
+                return {"code": 0, "message": "Success"}
+            if action in ("up", "down", "restart", "clean"):
+                self.compose_calls.append((action, param.get("id")))
+                return {"code": 0, "message": "Success"}
         return {"code": 0, "results": {}}
 
 
