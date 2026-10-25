@@ -121,7 +121,7 @@ def build_message(job, store, version=""):
             lines.append("失败步骤：%s %s" % (s.get("name") or s.get("key"),
                                             s.get("message") or ""))
     if getattr(job, "dry", None):
-        lines.append("（干跑模式，未改动任何容器）")
+        lines.append("（演练模式，未改动任何容器）")
     if version:
         lines.append("版本：v" + str(version))
     text = "\n".join(lines)

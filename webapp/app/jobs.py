@@ -547,18 +547,18 @@ class JobManager(object):
                 else:
                     raise
             job.step("pull", "done",
-                     "镜像已是最新" if already else ("干跑：仅演练" if dry else "下载任务已下发"))
+                     "镜像已是最新" if already else ("演练：只走流程" if dry else "下载任务已下发"))
 
             # 干跑模式：写操作都被拦下了，后面的等待/更新/验证都没有真实意义，直接模拟
             if dry:
-                job.step("download", "done", "干跑：跳过等待")
-                job.step("update", "done", "干跑：未实际执行")
+                job.step("download", "done", "演练：跳过等待")
+                job.step("update", "done", "演练：未实际执行")
                 try:
                     cur = {x["name"]: x for x in A.get_containers(ik)}.get(c["name"]) or {}
-                    job.step("verify", "done", "干跑保持原状：" + (cur.get("status") or "未知"))
+                    job.step("verify", "done", "演练，保持原状：" + (cur.get("status") or "未知"))
                 except A.IKuaiError:
-                    job.step("verify", "done", "干跑：未验证")
-                job.log("🔎 干跑完成，未对路由器做任何修改。关闭「干跑模式」后重跑即会真实执行。",
+                    job.step("verify", "done", "演练：未验证")
+                job.log("🔎 演练完成，未对路由器做任何修改。关掉顶栏的「演练」后重跑就会真实执行。",
                         level="warn")
                 continue
 

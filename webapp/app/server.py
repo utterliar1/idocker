@@ -1047,7 +1047,7 @@ def main():
     print("              （上游检测优先用爱快 Docker 服务设置里配的加速源）", flush=True)
     print("  下载超时    %d 秒（可在页面上调整）" % CFG["pull_timeout"], flush=True)
     print("  定时任务    %d 条" % len(STORE.schedules()), flush=True)
-    print("  干跑模式    %s" % ("开启" if CFG.get("dry_run") else "关闭"), flush=True)
+    print("  演练模式    %s" % ("开启" if CFG.get("dry_run") else "关闭"), flush=True)
     print("  访问认证    %s" % ("登录页（账号 %s）" % os.environ["AUTH_USER"]
                               if auth_enabled() else "关闭"), flush=True)
     print("=" * 62, flush=True)
