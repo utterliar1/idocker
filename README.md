@@ -34,6 +34,9 @@
 
 ---
 
+> 只要图形界面：直接用 `webapp/`（ghcr.io 现成镜像，一条 compose 起容器），
+> 容器、镜像、网络、编排、定时任务、审计都能在网页上管，见 [`webapp/README.md`](webapp/README.md)。
+
 ## 目录
 
 | 文件 | 作用 |
@@ -44,7 +47,7 @@
 | `capture-ikuai-api.js` | 浏览器抓包脚本（3.7 或接口大改时的兜底手段） |
 | `config.example.json` | 可选配置（默认直接读 `.env`，不需要它） |
 | `state.json` | 自动生成，记录上次检测到的上游 digest（已 gitignore） |
-| `webapp/` | **Web 可视化版**，Docker / 飞牛部署用，见 `webapp/README.md` |
+| `webapp/` | **Web 管理台**（容器 / 镜像 / 网络 / 编排 / 定时任务 / 审计 + 六步更新流程），Docker / 飞牛部署用，见 `webapp/README.md` |
 | `_test/` | 本地回归测试（假爱快 + DOM 桩，零依赖），CI 里跑的就是它 |
 | `deploy_webapp.py` | 一键把 `webapp/` 同步到飞牛并重建容器 |
 | `.github/workflows/ci.yml` | CI：验证 → 构建推 ghcr.io → 冒烟测试 |
@@ -112,7 +115,7 @@ flatnas      qdnas/flatnas:latest           已是最新     06-15 20:02   sha25
 lucky        gdy666/lucky:latest            ⬆ 有新版本   未安装        sha256:94bef557d1a8
 ```
 
-### 2. 干跑，确认要发出的请求
+### 2. 先演练，确认要发出的请求
 
 ```bash
 python ikuai_docker_updater.py --dry-run -v update lucky
