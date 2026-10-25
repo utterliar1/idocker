@@ -1745,6 +1745,71 @@ ok("审计里的环境变量被打码（不留 token）",
    _created[0].get("params") if _created else None)
 ok("审计带时间与目标", _rows[0].get("at") and "target" in _rows[0], _rows[0])
 
+print("\n=== 47. http 被拒时自动升级到 https ===")
+# 爱快对 http 的 /Action/login 会 302 到 https，urllib 跟随时把 POST 降级成 GET，
+# 结果是一个 401 + nginx 页面 —— 看上去像密码错了，其实只是协议前缀不对。
+# 生产上就是这么踩的：IKUAI_URL 写成 http:// 之后整个面板报「读取失败」。
+import io as _io
+import ikuai_api as _A
+
+
+class _FakeResp(object):
+    def __init__(self, body):
+        self._body = body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _FakeOp(object):
+    """http 一律 401，https 正常回 Result=10000。"""
+
+    def __init__(self):
+        self.calls = []
+
+    def open(self, req, timeout=None):
+        self.calls.append(req.full_url)
+        if req.full_url.startswith("http://"):
+            raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {},
+                                         _io.BytesIO(b"<html>401</html>"))
+        return _FakeResp(b'{"Result": 10000, "code": 0}')
+
+
+_cfg47 = {"router": {"url": "http://192.168.1.1", "username": "u", "password": "p"},
+          "timeout": 5}
+_ik47 = _A.IKuai(_cfg47, _A.Ctx())
+_ik47.op = _FakeOp()
+_ik47.login()
+ok("http 401 后自动改用 https 重试并成功", _ik47.base == "https://192.168.1.1", _ik47.base)
+ok("两次请求分别走了 http 和 https",
+   _ik47.op.calls == ["http://192.168.1.1/Action/login",
+                      "https://192.168.1.1/Action/login"], _ik47.op.calls)
+
+
+class _FakeOp500(_FakeOp):
+    def open(self, req, timeout=None):
+        self.calls.append(req.full_url)
+        raise urllib.error.HTTPError(req.full_url, 500, "Server Error", {},
+                                     _io.BytesIO(b"boom"))
+
+
+_ik47b = _A.IKuai(dict(_cfg47, router=dict(_cfg47["router"])), _A.Ctx())
+_ik47b.op = _FakeOp500()
+try:
+    _ik47b.login()
+    _raised = False
+except _A.IKuaiError:
+    _raised = True
+ok("非 401/403 的错误不重试（不掩盖真问题）",
+   _raised and _ik47b.base == "http://192.168.1.1", _ik47b.base)
+ok("500 只发了一次请求", len(_ik47b.op.calls) == 1, _ik47b.op.calls)
+
 # ---- 收尾：把还在跑的任务等完、把两个 HTTP 服务关掉再退出 ----
 # 否则守护线程会在解释器最终化时被硬杀，容易在退出阶段炸掉（CI 上实测 exit 139，
 # 而 131 项断言其实全过了 —— 问题出在收尾，不是测试本身）。

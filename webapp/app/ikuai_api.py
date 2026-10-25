@@ -187,6 +187,21 @@ class IKuai(object):
         except ValueError:
             raise IKuaiError("返回不是 JSON：%s" % mask_secret(text[:300]))
 
+    def _upgrade_to_https(self):
+        """把 http 基址换成 https，返回是否真的换了。
+
+        为什么需要这个：IKUAI_URL 常常只写 IP（不带协议），而配置里又可能被
+        写成 http://。爱快后台对 http 的 /Action/login 会 302 到 https，
+        urllib 跟随时会把 POST 降级成 GET，于是拿回一个 401 + nginx 错误页 ——
+        看上去像「密码错了」，其实是协议没对上。这里一旦发现 401/403 就自己
+        升到 https 再试一次，避免为了一个协议前缀去改部署配置。
+        """
+        if not self.base.startswith("http://"):
+            return False
+        self.base = "https://" + self.base[len("http://"):]
+        self.ctx.vlog("http 被拒，改用 %s 重试" % self.base)
+        return True
+
     def login(self):
         r = self.cfg["router"]
         user = r.get("username")
@@ -199,7 +214,14 @@ class IKuai(object):
             "pass": base64.b64encode(("salt_11" + pw).encode()).decode(),
             "remember_password": "",
         }
-        resp = self._post(r.get("login_path", "/Action/login"), payload)
+        try:
+            resp = self._post(r.get("login_path", "/Action/login"), payload)
+        except IKuaiError as e:
+            msg = str(e)
+            if ("HTTP 401" in msg or "HTTP 403" in msg) and self._upgrade_to_https():
+                resp = self._post(r.get("login_path", "/Action/login"), payload)
+            else:
+                raise
         if not (resp.get("Result") == 10000 or resp.get("code") == 0):
             raise IKuaiError("登录失败：%s" % mask_secret(json.dumps(resp, ensure_ascii=False)[:200]))
         self.ctx.vlog("登录成功，cookies=%s" % [c.name for c in self.jar])
