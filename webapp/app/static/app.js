@@ -107,6 +107,12 @@
     });
   }
 
+  // 爱快有些字段「空」的时候给的是 {} 而不是 []（实测：没被使用的镜像，
+  // containers 是 {}），直接 .map 会炸「is not a function」。统一收口。
+  function asList(v) {
+    return Array.isArray(v) ? v : [];
+  }
+
   function esc(s) {
     return String(s == null ? "" : s)
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -1069,12 +1075,12 @@
         ? '，并<b>切换为跟随 latest</b>（此后不再锁定在固定版本，上游一更新就能检测到）'
         : '，版本固定为 <b>' + esc(tag) + '</b>（此后锁定在该版本，不跟随 latest）';
     return confirmBox({
-      title: dry ? "确认演练更新" : (tag === "latest" ? "确认切换为跟随 latest" : "确认更新容器"),
+      title: dry ? "演练一次更新" : (tag === "latest" ? "确认切换为跟随 latest" : "确认更新容器"),
       html: '<p class="cfm-lead">将' + (dry ? "演练" : "") + '更新以下 <b>' + names.length +
             '</b> 个容器' + tagNote + '：</p>' +
             '<ul class="cfm-list">' + rows + '</ul>' +
             '<p class="cfm-note">' + (dry
-              ? "当前是<b>干跑模式</b>：只走一遍流程并打印将要发出的请求，<b>不会真的重启任何容器</b>。"
+              ? "当前是<b>演练模式</b>：只走一遍流程并打印将要发出的请求，<b>不会真的重启任何容器</b>。"
               : "过程中这些容器会各<b>重启一次</b>，服务短暂中断（几秒到几十秒，视镜像大小而定）。") +
             '</p>',
       okText: dry ? "开始演练" : (tag === "latest" ? "切到 latest" : "开始更新"),
@@ -1088,7 +1094,7 @@
     appendLog({ ts: Date.now() / 1000, level: "info",
                 message: "提交更新请求：" + names.join("、") +
                          (tag ? (" → " + tag) : "") +
-                         "（干跑：" + ($("dryRun").checked ? "开" : "关") + "）" });
+                         "（演练：" + ($("dryRun").checked ? "开" : "关") + "）" });
     var body = { containers: names, dry_run: $("dryRun").checked };
     if (tag) body.tag = tag;
     api("/api/update", { method: "POST", body: body }).then(function (j) {
@@ -1197,7 +1203,9 @@
       return String(a.name).localeCompare(String(b.name));
     });
     tb.innerHTML = rows.map(function (img) {
-      var users = (img.containers || []).map(function (c) { return c.name || c; });
+      var users = asList(img.containers).map(function (c) {
+        return (c && c.name) || c;
+      });
       var tags = String(img.tag || "").split(",").map(function (t) { return t.trim(); })
         .filter(Boolean);
       return '<tr>' +
@@ -1326,7 +1334,7 @@
       return;
     }
     tb.innerHTML = list.map(function (n) {
-      var cs = n.containers || [];
+      var cs = asList(n.containers);
       return '<tr>' +
         '<td data-label="名称"><div class="mono">' + esc(n.name) + '</div></td>' +
         '<td class="mono" data-label="子网">' + esc(n.subnet || "—") + '</td>' +
@@ -1471,7 +1479,7 @@
     var t = (state.settings || {}).pull_timeout;
     if (t) {
       $("scTimeout").textContent = "下载超时 " + fmtDuration(t) +
-        ($("dryRun").checked ? " · 干跑中改不了真容器" : "");
+        ($("dryRun").checked ? " · 演练中，不会真改容器" : "");
       if (!state.setInited) { $("setTimeout").value = t; state.setInited = true; }
     }
     renderSchedules();
@@ -2015,7 +2023,9 @@
   });
 
   // 设置 / 定时任务
-  $("btnSettingsTop").addEventListener("click", openSettings);
+  Array.prototype.forEach.call(
+    document.querySelectorAll("#btnSettingsTop, .btn-settings"),
+    function (b) { b.addEventListener("click", openSettings); });
   $("btnCloseSet").addEventListener("click", function () { $("setModal").classList.add("hidden"); });
   $("btnSetSave").addEventListener("click", saveSettings);
   $("btnNewSchedule").addEventListener("click", function () { openSchedule(null); });

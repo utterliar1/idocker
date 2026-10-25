@@ -59,9 +59,8 @@
     </nav>
 
     <div class="sidebar-foot">
-      <button class="btn tiny ghost full" id="btnSettingsTop">设置</button>
-      <button class="btn tiny ghost full hidden" id="btnLogout">退出登录</button>
       <div class="ver" id="verInfo">—</div>
+      <button class="link-btn hidden" id="btnLogout">退出登录</button>
     </div>
   </aside>
 
@@ -74,11 +73,14 @@
         <div class="sub" id="connInfo">正在连接…</div>
       </div>
       <div class="topbar-actions">
-        <label class="switch" title="只演练不真正改动容器">
-          <input type="checkbox" id="dryRun"><span class="switch-track"></span><span>干跑</span>
+        <label class="switch" title="演练模式：完整走一遍流程并打印将要发出的请求，但不真的改动任何容器">
+          <input type="checkbox" id="dryRun"><span class="switch-track"></span><span>演练</span>
         </label>
         <button class="btn ghost" id="btnAuto" title="自动刷新容器与状态">
           <i class="dot" id="autoDot"></i><span id="autoLabel">自动刷新</span>
+        </button>
+        <button class="btn ghost icon-btn btn-settings" id="btnSettingsTop" title="设置：下载超时、通知、镜像加速源">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8a4 4 0 100 8 4 4 0 000-8zm0 6a2 2 0 110-4 2 2 0 010 4zm8.4-1.6l1.6-1.2-1.6-2.8-1.9.7a6.9 6.9 0 00-1.7-1l-.3-2h-3.2l-.3 2a6.9 6.9 0 00-1.7 1l-1.9-.7-1.6 2.8 1.6 1.2a7 7 0 000 2l-1.6 1.2 1.6 2.8 1.9-.7c.5.4 1.1.7 1.7 1l.3 2h3.2l.3-2c.6-.3 1.2-.6 1.7-1l1.9.7 1.6-2.8-1.6-1.2a7 7 0 000-2z"/></svg>
         </button>
         <button class="btn ghost" id="btnRefresh">刷新</button>
         <button class="btn primary" id="btnCheck">检查更新</button>

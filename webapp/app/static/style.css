@@ -82,8 +82,17 @@ h1, h2, h3 { margin: 0; font-weight: 600; }
 }
 .nav-item.on .nav-count { background: #fff; color: var(--accent); border-color: #dcdcfb; }
 
-.sidebar-foot { margin-top: auto; padding-top: 12px; display: flex; flex-direction: column; gap: 6px; }
-.ver { color: var(--text-3); font-size: 11.5px; padding: 4px 8px; }
+.sidebar-foot {
+  margin-top: auto; padding: 12px 8px 2px; border-top: 1px solid var(--line);
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+}
+.ver { color: var(--text-3); font-size: 11.5px; }
+/* 退出登录：不做成按钮，免得和主操作抢视觉 */
+.link-btn {
+  border: 0; background: none; padding: 0; font-family: inherit; font-size: 11.5px;
+  color: var(--text-3); cursor: pointer; transition: color .12s;
+}
+.link-btn:hover { color: var(--danger); }
 
 .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 
@@ -125,6 +134,10 @@ h1, h2, h3 { margin: 0; font-weight: 600; }
 .btn.small { padding: 5px 10px; font-size: 12.5px; }
 .btn.tiny { padding: 3px 8px; font-size: 12px; border-radius: 6px; }
 .btn.full { width: 100%; justify-content: center; }
+/* 顶栏图标按钮：只有图形，hover 才显出边界 */
+.btn.icon-btn { padding: 6px 8px; }
+.btn.icon-btn svg { width: 15px; height: 15px; fill: currentColor; opacity: .8; }
+.btn.icon-btn:hover svg { opacity: 1; }
 .btn.auto.off { color: var(--text-3); }
 .btn .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); }
 .btn.off .dot { background: var(--text-3); }

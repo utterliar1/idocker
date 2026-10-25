@@ -352,7 +352,17 @@ def get_containers(ik):
 
 
 def get_local_images(ik):
-    return (ik.call("docker_image", "show", {"TYPE": "data"}).get("results") or {}).get("data") or []
+    """本地镜像列表。
+
+    爱快对「没有任何容器在用」的镜像返回 ``containers: {}``（空对象，不是空数组），
+    前端直接 ``.map`` 会炸「is not a function」。这里统一成数组，别让每个调用方
+    都自己防一遍。
+    """
+    out = (ik.call("docker_image", "show", {"TYPE": "data"}).get("results") or {}).get("data") or []
+    for img in out:
+        if not isinstance(img.get("containers"), list):
+            img["containers"] = []
+    return out
 
 
 class LocalImages(object):

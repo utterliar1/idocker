@@ -1810,6 +1810,26 @@ ok("非 401/403 的错误不重试（不掩盖真问题）",
    _raised and _ik47b.base == "http://192.168.1.1", _ik47b.base)
 ok("500 只发了一次请求", len(_ik47b.op.calls) == 1, _ik47b.op.calls)
 
+print("\n=== 48. 镜像的 containers 字段统一成数组 ===")
+# 爱快对没被使用的镜像给的是 containers: {}（空对象），前端 .map 会直接崩。
+# 在 API 层就收口成 []，任何调用方都不必自己防。
+
+
+class _ImgIK(object):
+    def call(self, func, action, param=None):
+        return {"results": {"data": [
+            {"name": "unused/image", "tag": "latest", "containers": {}},
+            {"name": "used/image", "tag": "latest",
+             "containers": [{"name": "web", "state": "running"}]},
+        ]}}
+
+
+_imgs48 = _A.get_local_images(_ImgIK())
+ok("空对象被归一成空数组",
+   _imgs48[0]["containers"] == [], _imgs48[0].get("containers"))
+ok("本来就有容器的镜像不受影响",
+   [c["name"] for c in _imgs48[1]["containers"]] == ["web"], _imgs48[1].get("containers"))
+
 # ---- 收尾：把还在跑的任务等完、把两个 HTTP 服务关掉再退出 ----
 # 否则守护线程会在解释器最终化时被硬杀，容易在退出阶段炸掉（CI 上实测 exit 139，
 # 而 131 项断言其实全过了 —— 问题出在收尾，不是测试本身）。
