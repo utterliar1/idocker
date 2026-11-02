@@ -48,6 +48,47 @@ CHECK_STEPS = [
 ]
 
 HISTORY_LIMIT = 60
+
+
+def container_exists(ik, name):
+    return any(c.get("name") == name for c in A.get_containers(ik))
+
+
+def restore_container(ik, job, payload, tries=3, gap=5):
+    """容器在改镜像途中消失时，用更新前的快照把它重建回来。
+
+    爱快的 ``docker_container update`` 是**先删后建**：建失败时既不回滚也不报错
+    （返回空 body 就算成功）。线上真踩过 —— vaultwarden 1.37.4 → 1.37.5 那次，
+    容器整只没了，搬运流程只能报一句「更新后查不到容器」。
+
+    所以每次改镜像之后都必须确认容器还在；不在就立刻按快照 ``add`` 回来。
+    固定 IP 在删除后还会被占几秒（爱快 release 有延迟），所以退避重试几次，
+    而不是一次失败就放弃。返回 True 表示容器最终存在。
+    """
+    name = payload.get("name")
+    if container_exists(ik, name):
+        return True
+    p = {k: v for k, v in payload.items() if k != "id"}   # add 不需要旧 id
+    job.log("⚠ %s 在改镜像时消失了（爱快删掉后没建回来）→ 正在用更新前的快照重建"
+            % name, level="warn")
+    for attempt in range(1, tries + 1):
+        try:
+            ik.call("docker_container", "add", dict(p))
+        except Exception as e:                              # noqa: BLE001
+            job.log("  第 %d 次重建请求失败：%s" % (attempt, e), level="debug")
+        for _ in range(8):
+            time.sleep(1)
+            if container_exists(ik, name):
+                job.log("✅ 已用快照把 %s 重建回来（%s），服务已恢复"
+                        % (name, p.get("image")), level="warn")
+                return True
+        time.sleep(gap)
+    job.log("❌ 重建 %s 也失败了，容器现在**不存在**。请在爱快后台手动新建："
+            "镜像 %s ／ 挂载 %s ／ IP %s ／ 自启 %s"
+            % (name, p.get("image"), p.get("mounts") or "无",
+               p.get("ipaddr") or "自动", "开" if p.get("auto_start") else "关"),
+            level="error")
+    return False
 # 每条历史保留多少行日志。日志是「事后唯一能还原现场的东西」——
 # 只存成功/失败，过几天回头看完全不知道当时发生了什么。
 LOG_KEEP = 500
@@ -521,6 +562,8 @@ class JobManager(object):
             # 3. 拉镜像
             job.step("pull", "running", "拉取 %s:%s" % (iname, new_tag))
             payload, unmapped = A.container_payload(c, insp, tag=new_tag)
+            # 兜底快照：万一爱快把容器删了没建回来，用它按原样重建
+            p_orig, _ = A.container_payload(c, insp)
             # 不把 env/cmd 写入普通日志；它们可能包含 API 密钥、密码和内部路径。
             job.log("容器参数摘要：镜像=%s，挂载=%s，环境变量=%s，启动命令=%s" % (
                 payload.get("image") or "未设置",
@@ -766,8 +809,14 @@ class JobManager(object):
                 if after and after.get("state") == "running":
                     break
             if not after:
-                job.step("verify", "failed", "回查不到容器")
-                job.log("❌ %s 更新后查不到，请到爱快后台确认" % c["name"], level="error")
+                # 爱快 update 是「先删后建」，建失败会连容器一起没掉（线上真踩过）。
+                restored = restore_container(ik, job, p_orig)
+                job.step("verify", "failed",
+                         "容器一度消失，已按原配置重建" if restored else "容器丢失且重建失败")
+                if restored:
+                    job.log("⚠ %s 这次切换没成功，但容器已按原配置（%s）重建，服务不受影响；"
+                            "可以稍后再点一次更新"
+                            % (c["name"], p_orig.get("image")), level="warn")
                 failures.append(c["name"])
                 continue
             if after.get("state") != "running":
@@ -982,15 +1031,20 @@ class JobManager(object):
         job.step("update", "running", "临时切到 %s:%s" % (iname, vt))
         # 用**当前**容器重新拼 payload：这份快照要带着最新 id，后面第 6 步同理
         _c_now = self._live(ik, name, c)
-        p_vt, _ = A.container_payload(_c_now, A.get_inspect(ik, _c_now.get("id")),
-                                      tag=vt)
+        _insp_now = A.get_inspect(ik, _c_now.get("id"))
+        p_vt, _ = A.container_payload(_c_now, _insp_now, tag=vt)
+        p_back, _ = A.container_payload(_c_now, _insp_now)   # 原 tag，用来兜底重建
         ik.call("docker_container", "update", p_vt)
         ok_vt, why = self._wait_running(ik, name, vt)
         if not ok_vt:
             job.step("update", "failed", "没能临时切到 %s" % vt)
-            job.step("verify", "skipped", "容器可能停在 %s" % vt)
-            job.log("❌ 容器没能切到 %s:%s（%s）。请到爱快后台核对容器状态 —— "
-                    "搬运在第一步就停下了，latest 还没修好" % (iname, vt, why),
+            restored = restore_container(ik, job, p_back)
+            job.step("verify", "skipped",
+                     "已按原配置重建" if restored else "容器可能停在 %s" % vt)
+            job.log("❌ 容器没能切到 %s:%s（%s）。搬运在第一步就停下了，latest 还没修好%s"
+                    % (iname, vt, why,
+                       "；容器已按原配置（%s）重建，服务不受影响" % p_back.get("image")
+                       if restored else "，而且重建也失败了 —— 请到爱快后台处理"),
                     level="error")
             return False, why
 
@@ -1045,16 +1099,22 @@ class JobManager(object):
         # 🔴 必须重读容器：第 3 步的 update 已经重建过容器，id 变了。
         # 拿旧 id 下发，爱快回 Success 却什么都不做（实测），容器会停在版本号 tag 上。
         _c_now2 = self._live(ik, name, c)
-        p_lt, _ = A.container_payload(_c_now2, A.get_inspect(ik, _c_now2.get("id")),
-                                      tag=new_tag)
+        _insp2 = A.get_inspect(ik, _c_now2.get("id"))
+        p_lt, _ = A.container_payload(_c_now2, _insp2, tag=new_tag)
+        p_back2, _ = A.container_payload(_c_now2, _insp2, tag=vt)
         ik.call("docker_container", "update", p_lt)
         ok_lt, why_lt = self._wait_running(ik, name, new_tag)
         if not ok_lt:
             job.step("update", "failed", "没能切回 %s" % new_tag)
+            restored2 = restore_container(ik, job, p_back2)
             job.step("verify", "failed", why_lt)
-            job.log("❌ 容器没能切回 %s:%s（%s）。镜像已经是最新的了，容器目前挂在 "
-                    "%s:%s 上，请到爱快后台核对或再点一次更新。"
-                    % (iname, new_tag, why_lt, iname, vt), level="error")
+            job.log("❌ 容器没能切回 %s:%s（%s）%s。镜像内容已经是最新的了（%s:%s 与 "
+                    "%s 内容相同）%s"
+                    % (iname, new_tag, why_lt,
+                       "，已按 %s:%s 重建" % (iname, vt) if restored2 else "",
+                       iname, vt, new_tag,
+                       "" if restored2 else "，而且重建也失败了 —— 请到爱快后台处理"),
+                    level="error")
             return False, why_lt
 
         job.step("update", "done", "已切回 %s:%s" % (iname, new_tag))

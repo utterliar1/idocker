@@ -1830,6 +1830,76 @@ ok("空对象被归一成空数组",
 ok("本来就有容器的镜像不受影响",
    [c["name"] for c in _imgs48[1]["containers"]] == ["web"], _imgs48[1].get("containers"))
 
+print("\n=== 49. 改镜像时容器被爱快删没了 → 用快照自动重建 ===")
+import jobs as jobs                                              # noqa: E402
+# 线上真实故障：vaultwarden 1.37.4→1.37.5，爱快 update 先删后建、建失败，
+# 容器整只消失，工具只报一句「更新后查不到容器」。现在必须自动重建。
+
+
+class _JobStub(object):
+    def __init__(self):
+        self.lines = []
+
+    def log(self, msg, level="info"):
+        self.lines.append((level, msg))
+
+    def step(self, *a, **k):
+        pass
+
+
+def _snapshot(name):
+    """从 mock 里拿一个容器的 add payload（等于更新前的快照）"""
+    c = {x["name"]: x for x in mock_router.FAKE.containers}[name]
+    return {"name": c["name"], "image": c["image"], "tag": "latest",
+            "interface": c.get("interface"), "ipaddr": c.get("ipaddr"),
+            "mounts": c.get("mounts"), "env": c.get("env"), "cmd": c.get("cmd"),
+            "auto_start": 1, "enabled": "yes", "memory": 0,
+            "file_size": 1048576, "file_num": 1, "cpushares": 0, "ports": ""}
+
+
+_ik49 = _A.IKuai(dict(server.CFG, router=dict(server.CFG["router"])), _A.Ctx())
+_ik49.login()
+_p49 = _snapshot("clash")
+
+# ① 容器先「消失」，重建后必须回来
+mock_router.FAKE.containers = [c for c in mock_router.FAKE.containers
+                               if c["name"] != "clash"]
+_j49 = _JobStub()
+_ok49 = jobs.restore_container(_ik49, _j49, _p49)
+_names49 = [c["name"] for c in mock_router.FAKE.containers]
+ok("容器消失后用快照重建成功", _ok49 is True, _j49.lines)
+ok("重建后容器回来了且在跑",
+   "clash" in _names49 and
+   {x["name"]: x for x in mock_router.FAKE.containers}["clash"]["state"] == "running",
+   _names49)
+ok("重建用的是快照里的镜像与挂载",
+   {x["name"]: x for x in mock_router.FAKE.containers}["clash"]["image"] == "dreamacro/clash:latest"
+   and "clash" in {x["name"]: x for x in mock_router.FAKE.containers},
+   {x["name"]: x for x in mock_router.FAKE.containers}.get("clash"))
+ok("日志明确说了「已用快照重建」",
+   any("已用快照" in m for _, m in _j49.lines), _j49.lines)
+
+# ② 重建本身失败时，要给出可执行的手工指引，而不是静默
+mock_router.FAKE.containers = [c for c in mock_router.FAKE.containers
+                               if c["name"] != "clash"]
+mock_router.FAKE.reject_add = True
+_j49b = _JobStub()
+_ok49b = jobs.restore_container(_ik49, _j49b, _p49, tries=2, gap=0)
+mock_router.FAKE.reject_add = False
+ok("重建失败时返回 False", _ok49b is False, _j49b.lines)
+ok("重建失败时给出「手动新建」的镜像/挂载/IP 指引",
+   any("手动新建" in m and "dreamacro/clash:latest" in m for _, m in _j49b.lines),
+   [m for _, m in _j49b.lines])
+
+# ③ 恢复现场：把 clash 建回去，后面的用例还要用
+if "clash" not in [c["name"] for c in mock_router.FAKE.containers]:
+    mock_router.FAKE.containers.append({
+        "id": "aaaa1111bbbb", "name": "clash", "image": "dreamacro/clash:latest",
+        "state": "running", "status": "Up 3 days", "interface": "doc_docker",
+        "ipaddr": "192.168.3.2", "ip6addr": "", "auto_start": 1,
+        "mounts": "/vol1/1000/clash:/root/.config", "ports": [],
+        "env": "TZ=Asia%2FShanghai", "cmd": "", "comment": "", "image_logo": ""})
+
 # ---- 收尾：把还在跑的任务等完、把两个 HTTP 服务关掉再退出 ----
 # 否则守护线程会在解释器最终化时被硬杀，容易在退出阶段炸掉（CI 上实测 exit 139，
 # 而 131 项断言其实全过了 —— 问题出在收尾，不是测试本身）。

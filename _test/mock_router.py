@@ -120,6 +120,10 @@ class Fake(object):
         # （回 Success 却什么都不做）。默认关，测搬运流程时打开。
         self.id_changes_on_update = False
         self.strict_update_id = False
+        # 线上真踩过：update 先删后建，建失败就把容器删没了（返回的却是成功）。
+        # 打开它来复现「容器消失」，验证上层会用快照重建。
+        self.drop_on_update = False
+        self.reject_add = False
         self.update_ignored = []
         self._nid = 0
 
@@ -185,6 +189,11 @@ class Fake(object):
                 return {"code": 0, "results": {"data": self.containers}}
             if action == "update":
                 self.update_calls.append(param)
+                if self.drop_on_update:
+                    # 模拟爱快「删了没建回来」：容器消失，但接口仍回成功
+                    self.containers = [c for c in self.containers
+                                       if c.get("name") != param.get("name")]
+                    return {}
                 # 真实爱快只认 image 字段（**必须带 tag**），单独的 tag 字段会被忽略。
                 # 这里如实模拟：image 不带 tag 时容器就仍挂在 latest 上 ——
                 # 正是「镜像下好了却没切过去」那个 bug 的成因。
@@ -231,6 +240,8 @@ class Fake(object):
                 return {"code": 0, "message": "Success"}
             if action == "add":
                 self.add_calls.append(dict(param))
+                if self.reject_add:
+                    return {"code": 1, "message": "add rejected for test"}
                 c = {"id": "sha256:" + ("%064x" % (0xC0D000 + len(self.containers))),
                      "name": param.get("name"), "image": param.get("image"),
                      "state": "running" if param.get("enabled") != "no" else "exited",
