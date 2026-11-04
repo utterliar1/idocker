@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>idocker · 爱快 Docker 管理</title>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=__ASSET_V__">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐳</text></svg>">
 </head>
 <body>
@@ -19,6 +19,9 @@
         <strong>idocker</strong>
         <small>爱快 Docker 管理</small>
       </div>
+      <button class="side-toggle" id="btnSideToggle" title="收起侧栏（再点展开）" aria-label="收起侧栏">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.5 5.5L9 12l6.5 6.5 1.4-1.4L11.8 12l5.1-5.1z"/></svg>
+      </button>
     </div>
 
     <nav class="nav" id="nav">
@@ -80,7 +83,7 @@
           <i class="dot" id="autoDot"></i><span id="autoLabel">自动刷新</span>
         </button>
         <button class="btn ghost icon-btn btn-settings" id="btnSettingsTop" title="设置：下载超时、通知、镜像加速源">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8a4 4 0 100 8 4 4 0 000-8zm0 6a2 2 0 110-4 2 2 0 010 4zm8.4-1.6l1.6-1.2-1.6-2.8-1.9.7a6.9 6.9 0 00-1.7-1l-.3-2h-3.2l-.3 2a6.9 6.9 0 00-1.7 1l-1.9-.7-1.6 2.8 1.6 1.2a7 7 0 000 2l-1.6 1.2 1.6 2.8 1.9-.7c.5.4 1.1.7 1.7 1l.3 2h3.2l.3-2c.6-.3 1.2-.6 1.7-1l1.9.7 1.6-2.8-1.6-1.2a7 7 0 000-2z"/></svg>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19.43 12.98c.04-.32.07-.64.07-.98s-.03-.66-.07-.98l2.11-1.65a.5.5 0 0 0 .12-.64l-2-3.46a.5.5 0 0 0-.61-.22l-2.49 1a7.3 7.3 0 0 0-1.69-.98l-.38-2.65A.49.49 0 0 0 14 2h-4a.49.49 0 0 0-.49.42l-.38 2.65c-.61.25-1.17.59-1.69.98l-2.49-1a.5.5 0 0 0-.61.22l-2 3.46a.5.5 0 0 0 .12.64l2.11 1.65c-.04.32-.07.65-.07.98s.03.66.07.98l-2.11 1.65a.5.5 0 0 0-.12.64l2 3.46c.14.24.42.34.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65c.04.24.25.42.49.42h4c.24 0 .45-.18.49-.42l.38-2.65c.61-.25 1.17-.59 1.69-.98l2.49 1c.23.08.47-.02.61-.22l2-3.46a.5.5 0 0 0-.12-.64l-2.11-1.65zM12 15.5A3.5 3.5 0 1 1 12 8a3.5 3.5 0 0 1 0 7.5z"/></svg>
         </button>
         <button class="btn ghost" id="btnRefresh">刷新</button>
         <button class="btn primary" id="btnCheck">检查更新</button>
@@ -625,6 +628,6 @@
 <!-- 轻提示（右上角堆叠，自动消失） -->
 <div class="toast-wrap" id="toastWrap"></div>
 
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=__ASSET_V__"></script>
 </body>
 </html>

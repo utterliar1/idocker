@@ -1187,7 +1187,8 @@ class JobManager(object):
             item = {"container": p["container"], "image": key, "local": p["local"],
                     "status": "unknown", "digest": "", "registry": "", "pinned": "",
                     "local_id": A.norm_digest(local_sig)[:12],
-                    "upstream_id": "", "basis": ""}
+                    "upstream_id": "", "basis": "",
+                    "newer_tag": hit.get("newer_tag") or ""}
             err = hit.get("error") or ""
             if err:
                 item["status"] = "failed"
@@ -1220,6 +1221,10 @@ class JobManager(object):
                 else:
                     job.log("· %s 首次检测，已记下上游指纹 %s（命中 %s）"
                             % (key, item["upstream_id"] or digest[:19], reg))
+            if item["newer_tag"]:
+                job.log("⬆ %s 现在锁在 %s，上游同一条版本线已经有 %s —— 可以点行内"
+                        "「升到 %s」直接切过去（锁定状态下不会动它）"
+                        % (key, tag, item["newer_tag"], item["newer_tag"]), level="warn")
             if item["pinned"] == "ahead":
                 job.log("⚑ %s 锁定在 %s，但 %s:latest 已更新"
                         "（可用行内「指定版本」填 latest 切回跟随）"
@@ -1234,7 +1239,8 @@ class JobManager(object):
         job.step("query", "done", "共检查 %d 个镜像" % len(results))
         job.emit("check_result", results=results)
         self._save_last_check(results)
-        newer = [r["container"] for r in results if r["status"] == "newer"]
+        newer = [r["container"] for r in results
+                 if r["status"] == "newer" or r.get("newer_tag")]
         pinned = [r["container"] for r in results if r.get("pinned") == "ahead"]
         job.log("检测完成，%d 个镜像有新版%s"
                 % (len(newer), ("：" + "、".join(newer)) if newer else ""))
@@ -1261,7 +1267,28 @@ class JobManager(object):
         job.log("并发查询 %d 个镜像（%d 路）…" % (len(plans), workers))
         latest_lock = threading.Lock()
         latest_cache = {}          # repo → latest digest，避免同一仓库重复查
+        tags_cache = {}            # repo → 上游 tag 列表
         extra_notes = []
+
+        def tags_of(repo):
+            """上游 tag 列表（同一仓库只查一次）。
+
+            锁在版本号 tag 上的容器，同 tag 的内容永远不变，只比对 digest 会
+            永远得出「已是最新」。要知道有没有新版，就得看这个仓库还有没有
+            更高的版本号 —— 这正是 newest_tag 要做的事。
+            """
+            with latest_lock:
+                if repo in tags_cache:
+                    return tags_cache[repo]
+            try:
+                tags, _reg = A.remote_tags(registries, repo, None, cfg["timeout"])
+            except Exception as e:                              # noqa: BLE001
+                tags = []
+                with latest_lock:
+                    extra_notes.append("· 读 %s 的 tag 列表失败：%s" % (repo, e))
+            with latest_lock:
+                tags_cache[repo] = tags
+            return tags
 
         def latest_of(repo):
             with latest_lock:
@@ -1283,7 +1310,7 @@ class JobManager(object):
             line_ctx = A.Ctx(logger=lambda m, level="info": lines.append((level, str(m))),
                              verbose=True)
             hit = {"lines": lines, "digest": "", "up_cfg": "", "reg": "",
-                   "pinned": "", "error": ""}
+                   "pinned": "", "newer_tag": "", "error": ""}
             try:
                 digest, up_cfg, reg = A.remote_platform_digest(
                     registries, p["repo"], p["tag"], line_ctx, cfg["timeout"])
@@ -1297,6 +1324,12 @@ class JobManager(object):
                     lv = latest_of(p["repo"])
                     if lv and lv != digest:
                         hit["pinned"] = "ahead"
+                # 不限于「纯版本号」：v3.4.0_xiaojv_waf 这种带后缀的也算一条版本线，
+                # 只要前缀/后缀相同就能比大小（1.37.5-alpine 与 1.37.5 不会互相误判）。
+                if A.version_shape(p["tag"]):
+                    nt = A.newest_tag(tags_of(p["repo"]), p["tag"])
+                    if nt:
+                        hit["newer_tag"] = nt
             except Exception as e:                              # noqa: BLE001
                 hit["error"] = str(e)
             return hit
@@ -1325,6 +1358,7 @@ class JobManager(object):
             items[r["image"]] = {"status": r["status"], "digest": r.get("digest", ""),
                                  "registry": r.get("registry", ""), "local": r.get("local", ""),
                                  "pinned": r.get("pinned", ""),
+                                 "newer_tag": r.get("newer_tag", ""),
                                  "local_id": r.get("local_id", ""),
                                  "upstream_id": r.get("upstream_id", ""),
                                  "basis": r.get("basis", "")}

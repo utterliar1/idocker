@@ -55,7 +55,7 @@ import notify as N             # noqa: E402
 import scheduler as SC         # noqa: E402
 import store as S              # noqa: E402
 
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 CFG = A.load_config()
 MANAGER = J.JobManager(CFG)
 # 持久化设置：页面里改的下载超时、定时任务、通知时机都落在这里（Docker 卷 /data）
@@ -589,10 +589,21 @@ class Handler(BaseHTTPRequestHandler):
         with open(target, "rb") as f:
             body = f.read()
         ext = os.path.splitext(target)[1].lower()
+
+        # 版本号塞进静态资源 URL：改完代码重启容器，浏览器/反代也不会拿旧的
+        # app.js、style.css 出来（之前踩过：新版界面被缓存挡住，用户看到的还是旧图标）。
+        cache = "no-cache"
+        if ext == ".html":
+            body = body.replace(b"__ASSET_V__", VERSION.encode("utf-8"))
+            cache = "no-store"          # 入口页永远拿最新的，否则 ?v= 也救不了
+        elif "?" in self.path or self.path.rstrip("/").endswith((".js", ".css")):
+            # 带 ?v= 的资源可以放心长期缓存：换版本号就是换 URL
+            cache = "public, max-age=31536000, immutable"
+
         self.send_response(200)
         self.send_header("Content-Type", MIME.get(ext, "application/octet-stream"))
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Cache-Control", cache)
         self.end_headers()
         self.wfile.write(body)
 

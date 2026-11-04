@@ -1900,6 +1900,44 @@ if "clash" not in [c["name"] for c in mock_router.FAKE.containers]:
         "mounts": "/vol1/1000/clash:/root/.config", "ports": [],
         "env": "TZ=Asia%2FShanghai", "cmd": "", "comment": "", "image_logo": ""})
 
+print("\n=== 50. 锁在版本号 tag 上的容器：能看出上游有没有更高版本 ===")
+# 「同 tag 内容固定」→ 只比 digest 永远说已是最新。要多问一句：这个仓库还有没有
+# 更高的版本号？前缀/后缀必须一致（1.37.5 与 1.37.5-alpine 是两条产品线）。
+
+ok("纯版本号：1.37.5 → 1.37.6",
+   _A.newest_tag(["1.37.4", "1.37.5", "1.37.6"], "1.37.5") == "1.37.6")
+ok("带后缀的版本线：v3.4.0_xiaojv_waf → v3.5.0_xiaojv_waf",
+   _A.newest_tag(["v3.4.0_xiaojv_waf", "v3.5.0_xiaojv_waf", "2.27.2", "latest"],
+                 "v3.4.0_xiaojv_waf") == "v3.5.0_xiaojv_waf")
+ok("不同后缀不互相比较（-alpine 不算更新）",
+   _A.newest_tag(["1.37.4-alpine", "1.37.9-alpine"], "1.37.5") == "",
+   _A.newest_tag(["1.37.4-alpine", "1.37.9-alpine"], "1.37.5"))
+ok("语义 tag 不参与（ssh / latest）",
+   _A.newest_tag(["ssh", "latest", "1.0.0"], "ssh") == "")
+ok("版本号按数字比大小，不是字符串（2.9 < 2.10）",
+   _A.newest_tag(["2.9", "2.10"], "2.9") == "2.10")
+ok("没有更高版本时返回空（避免假报可更新）",
+   _A.newest_tag(["1.37.3", "1.37.4", "latest"], "1.37.4") == "")
+
+# 集成：让上游多出 1.37.4 / 1.37.5，检测结果里应带上 newer_tag
+# （先把容器钉回 1.37.3 —— 前面的用例可能已经把它的 tag 改过了）
+for _c50 in mock_router.FAKE.containers:
+    if _c50["name"] == "vaultwarden":
+        _c50["image"] = "vaultwarden/server:1.37.3"
+_old_tags50 = dict(getattr(mock_router.FAKE, "tags", {}) or {})
+mock_router.FAKE.tags["vaultwarden/server"] = ["1.37.3", "1.37.4", "1.37.5",
+                                               "1.37.4-alpine", "latest"]
+_d50, _c50 = req("/api/check", {})
+ok("发起检测", _c50 == 200 and _d50.get("job_id"), _d50)
+wait_job(_d50["job_id"])
+_v50 = (server.MANAGER.last_check() or {}).get("items") or {}
+_it50 = _v50.get("vaultwarden/server:1.37.3") or {}
+ok("检测结果里带上「可升到 1.37.5」", _it50.get("newer_tag") == "1.37.5", _it50)
+ok("不会把 -alpine 变体当成更新", _it50.get("newer_tag") != "1.37.4-alpine", _it50)
+
+# 恢复了标签集，别影响后续用例
+mock_router.FAKE.tags = _old_tags50
+
 # ---- 收尾：把还在跑的任务等完、把两个 HTTP 服务关掉再退出 ----
 # 否则守护线程会在解释器最终化时被硬杀，容易在退出阶段炸掉（CI 上实测 exit 139，
 # 而 131 项断言其实全过了 —— 问题出在收尾，不是测试本身）。

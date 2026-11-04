@@ -945,6 +945,51 @@ def version_key(tag):
     return tuple(parts or [0])
 
 
+_TAG_SHAPE = re.compile(r"^(?P<pre>[^\d]*)(?P<ver>\d+(?:\.\d+)*)(?P<suf>.*)$")
+
+
+def version_shape(tag):
+    """把 tag 拆成 (前缀, 版本号元组, 后缀)；不含版本号返回 None。
+
+    ``v3.4.0_xiaojv_waf`` → ``("v", (3, 4, 0), "_xiaojv_waf")``
+    ``1.37.5``           → ``("", (1, 37, 5), "")``
+    ``ssh`` / ``latest`` → ``None``
+
+    为什么要连后缀一起认：``1.37.5`` 和 ``1.37.5-alpine`` 是两条平行产品线，
+    拿它们互相比较版本号会得出「1.37.5-alpine 更新」这种荒唐结论。只有前缀
+    和后缀都相同的 tag 才是同一条线，版本号才有可比性。
+    """
+    m = _TAG_SHAPE.match(str(tag or "").strip())
+    if not m:
+        return None
+    ver = tuple(int(x) for x in m.group("ver").split("."))
+    return m.group("pre"), ver, m.group("suf")
+
+
+def newest_tag(tags, current):
+    """在候选 tag 里找「同前缀同后缀、版本号更大」的最新那个，没有就返回空串。
+
+    这条专门治「容器按版本号拉、检测永远说已是最新」：同 tag 的内容当然不会变，
+    但上游可能早就推了 1.37.6 / v3.5.0_xiaojv_waf。这里把「有没有更新的版本号」
+    单独算出来，界面上就能说清楚「有新版本 1.37.6 可用」，而不是含糊的「已是最新」。
+    """
+    cur = version_shape(current)
+    if not cur:
+        return ""
+    pre, ver, suf = cur
+    best_tag, best_ver = "", ver
+    for t in tags or []:
+        sh = version_shape(t)
+        if not sh:
+            continue
+        t_pre, t_ver, t_suf = sh
+        if t_pre != pre or t_suf != suf:
+            continue
+        if t_ver > best_ver:
+            best_tag, best_ver = str(t).strip(), t_ver
+    return best_tag
+
+
 def remote_tags(registries, image, ctx=None, timeout=20):
     """直接从加速源读 tag 列表（``/v2/<repo>/tags/list``）。
 

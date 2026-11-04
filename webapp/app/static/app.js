@@ -13,6 +13,7 @@
     containers: [],
     checkMap: {},        // "repo:tag" → 上游状态
     pinMap: {},          // "repo:tag" → "ahead" 表示锁定在固定版本、但 latest 已更新
+    newTagMap: {},       // "repo:tag" → "1.37.6" 上游同一条版本线上更高的版本号
     checkAt: "",
     selected: {},
     job: null,
@@ -268,10 +269,12 @@
       var ck = d.check || {};
       state.checkMap = {};
       state.pinMap = {};
+      state.newTagMap = {};
       var items = ck.items || {};
       Object.keys(items).forEach(function (k) {
         state.checkMap[k] = items[k].status;
         if (items[k].pinned) state.pinMap[k] = items[k].pinned;
+        if (items[k].newer_tag) state.newTagMap[k] = items[k].newer_tag;
       });
       state.checkTs = ck.checked_at || 0;
       state.checkAt = ck.at_str || "";
@@ -390,6 +393,13 @@
   function checkKey(c) { return (c.repo || "") + ":" + (c.tag || ""); }
   function checkStatusOf(c) { return state.checkMap[checkKey(c)] || "unknown"; }
   function pinStatusOf(c) { return state.pinMap[checkKey(c)] || ""; }
+  // 上游同一条版本线上更高的版本号（例如锁在 1.37.5、上游已有 1.37.6）
+  function newTagOf(c) { return state.newTagMap[checkKey(c)] || ""; }
+  function upgradableContainers() {
+    return sortedContainers().filter(function (c) {
+      return checkStatusOf(c) !== "newer" && !!newTagOf(c);
+    });
+  }
   function pinnedContainers() {
     return sortedContainers().filter(function (c) { return pinStatusOf(c) === "ahead"; });
   }
@@ -410,13 +420,15 @@
 
   function renderUpdBar() {
     var total = state.containers.length;
-    var newer = 0, latest = 0, failed = 0, pinned = 0;
+    var newer = 0, latest = 0, failed = 0, pinned = 0, upgradable = 0;
     state.containers.forEach(function (c) {
       var k = checkStatusOf(c);
       if (k === "newer") newer++;
       else if (k === "latest") latest++;
       else if (k === "failed") failed++;
       if (pinStatusOf(c) === "ahead") pinned++;
+      // 锁在版本号 tag 上、但上游同一条线已有更高版本（1.37.5 → 1.37.6）
+      if (k !== "newer" && newTagOf(c)) upgradable++;
     });
     var stat = $("updStat"), all = $("btnUpdateAll"), pin = $("btnPinToLatest");
     if (!stat) return;
@@ -444,14 +456,21 @@
     if (newer) {
       stat.className = "upd-stat newer";
       stat.textContent = "⬆ 有 " + newer + " 个容器可以更新" +
-        (failed ? "（另 " + failed + " 个查询失败）" : "") +
-        (pinned ? "；另有 " + pinned + " 个锁定在固定版本" : "");
+        (upgradable ? "，另有 " + upgradable + " 个锁定的容器能升到更高版本" : "") +
+        (failed ? "（另 " + failed + " 个查询失败）" : "");
       all.textContent = "更新这 " + newer + " 个";
       all.classList.remove("hidden");
-      if (pinned) showPin(); else hidePin();
+      if (pinned || upgradable) showPin(); else hidePin();
       return;
     }
     all.classList.add("hidden");
+    if (upgradable) {
+      stat.className = "upd-stat newer";
+      stat.textContent = "⬆ 有 " + upgradable + " 个容器锁在版本号 tag 上，" +
+        "上游同一条线已有更高版本 —— 点行内「升到 vX」即可切换";
+      if (pinned) showPin(); else hidePin();
+      return;
+    }
     if (pinned) {
       stat.className = "upd-stat pinned";
       stat.textContent = "⚑ 另有 " + pinned + " 个容器锁定在固定版本 tag，" +
@@ -534,11 +553,12 @@
           var pin = pinStatusOf(c) === "ahead";
           var running = String(c.state) === "running";
           var led = running ? "up" : "down";
+          var nt = (st !== "newer") ? newTagOf(c) : "";
           var stats = state.statMap[c.name] || {};
           var mem = stats.mem ? fmtBytes(stats.mem) : "—";
           var cpu = stats.cpu || "—";
           return '' +
-            '<tr class="' + (st === "newer" ? "need-upd" : (pin ? "row-pinned" : "")) +
+            '<tr class="' + (st === "newer" || nt ? "need-upd" : (pin ? "row-pinned" : "")) +
               '" data-name="' + esc(c.name) + '">' +
               '<td class="cb" data-label=""><input type="checkbox" class="ct-pick" data-name="' + esc(c.name) + '"' +
                 (state.selected[c.name] ? " checked" : "") + '></td>' +
@@ -550,9 +570,12 @@
                 esc(shortStatus(c.status)) + '</span></td>' +
               '<td class="mono" data-label="CPU">' + esc(cpu) + '</td>' +
               '<td class="mono" data-label="内存">' + esc(mem) + '</td>' +
-              '<td data-label="上游"><span class="badge ' + badge[0] + '" title="' +
-                esc(state.checkAt ? ("检测于 " + state.checkAt) : "尚未检测") + '">' +
-                badge[1] + '</span>' +
+              '<td data-label="上游">' + (nt
+                ? '<span class="badge newer" title="锁在 ' + esc(c.tag) +
+                  '，上游同一条版本线已有 ' + esc(nt) + '">⬆ 可升到 ' + esc(nt) + '</span>'
+                : '<span class="badge ' + badge[0] + '" title="' +
+                  esc(state.checkAt ? ("检测于 " + state.checkAt) : "尚未检测") + '">' +
+                  badge[1] + '</span>') +
                 (pin ? ' <span class="badge pin" title="该容器锁定在固定版本 tag（' + esc(c.tag) +
                        '），不跟随 latest；上游 latest 已有更新。点「切到 latest」可改为跟随 latest">⚑ 锁定</span>'
                      : '') + '</td>' +
@@ -565,6 +588,9 @@
                 '<button class="btn tiny ghost ct-info" data-name="' + esc(c.name) + '" title="详情与配置">详情</button> ' +
                 '<button class="btn tiny ghost ct-tag" data-name="' + esc(c.name) + '" ' +
                   'data-repo="' + esc(c.repo) + '" data-tag="' + esc(c.tag) + '">版本</button> ' +
+                (nt ? '<button class="btn tiny primary ct-upgrade" data-name="' + esc(c.name) +
+                      '" data-tag="' + esc(nt) + '" title="切到上游更高的版本 ' + esc(nt) + '">升到 ' +
+                      esc(nt) + '</button> ' : '') +
                 (pin ? '<button class="btn tiny primary ct-pin" data-name="' + esc(c.name) + '">切到 latest</button> ' : '') +
                 '<button class="btn tiny' + (st === "newer" ? " primary" : "") +
                   ' ct-upd" data-name="' + esc(c.name) + '">更新</button> ' +
@@ -600,6 +626,9 @@
     });
     Array.prototype.forEach.call(document.querySelectorAll(".ct-tag"), function (b) {
       b.addEventListener("click", function () { openTagModal(b.dataset.name, b.dataset.repo, b.dataset.tag); });
+    });
+    Array.prototype.forEach.call(document.querySelectorAll(".ct-upgrade"), function (b) {
+      b.addEventListener("click", function () { startUpdate([b.dataset.name], b.dataset.tag); });
     });
     Array.prototype.forEach.call(document.querySelectorAll(".ct-pin"), function (b) {
       b.addEventListener("click", function () { startUpdate([b.dataset.name], "latest"); });
@@ -997,6 +1026,8 @@
         state.checkMap[r.image] = r.status;
         if (r.pinned) state.pinMap[r.image] = r.pinned;
         else delete state.pinMap[r.image];
+        if (r.newer_tag) state.newTagMap[r.image] = r.newer_tag;
+        else delete state.newTagMap[r.image];
       });
       renderContainers();
     });
@@ -2159,6 +2190,29 @@
   /* ============================================================
      八、启动
      ============================================================ */
+  // 侧栏折叠：状态记在浏览器，换页面不丢
+  function setSidebar(collapsed) {
+    var app = document.querySelector(".app");
+    if (!app) return;
+    if (collapsed) app.classList.add("collapsed");
+    else app.classList.remove("collapsed");
+    var btn = $("btnSideToggle");
+    if (btn) {
+      btn.title = collapsed ? "展开侧栏" : "收起侧栏";
+      btn.setAttribute("aria-label", btn.title);
+    }
+    try { localStorage.setItem("ikuai_sidebar", collapsed ? "1" : "0"); } catch (e) {}
+  }
+  (function () {
+    var btn = $("btnSideToggle");
+    if (btn) {
+      btn.addEventListener("click", function () {
+        setSidebar(!document.querySelector(".app").classList.contains("collapsed"));
+      });
+    }
+    try { if (localStorage.getItem("ikuai_sidebar") === "1") setSidebar(true); } catch (e) {}
+  })();
+
   try {
     if (localStorage.getItem("ikuai_dry_run") === "1") $("dryRun").checked = true;
     if (localStorage.getItem("ikuai_show_debug") === "1") $("showDebug").checked = true;
