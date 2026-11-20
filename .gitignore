@@ -43,6 +43,7 @@ Thumbs.db
 _test/lucky_backup_*.json
 scratch/
 _tmp_*.py
+_tmp_*.json
 
 # 写死家宽 IPv6 / 域名的本机脚本（idocker 是公开仓库，刻意不入库）
 _test/acl_open_lucky_v6.py

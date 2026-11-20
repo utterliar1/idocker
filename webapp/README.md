@@ -263,6 +263,7 @@ http://飞牛IP:3001/?autocheck=0                         关掉「打开页面�
 | 版本检测全部「查询失败」 | 检测用的是**爱快 Docker 服务设置里的加速源**。先去爱快后台确认源可用；日志里「查询上游用的加速源」那行会写命中哪个源、什么原因 |
 | 构建时拉不到 `python:3.13-alpine` | 飞牛默认源 `docker.fnnas.com` 返回 401，Docker 不会自动回退官方源。给 `BASE_IMAGE` 加加速前缀（`docker.1ms.run/library/python:3.13-alpine`）后 `--build` |
 | 容器 Up，但服务打不开 | 多半是镜像换了 entrypoint、旧容器的 `cmd` 被带过去（典型：`start.sh` 里 `ps aux \| grep` 匹配到自己的命令行，无限空转）。清空该容器的 `cmd`。工具会在更新后核查启动日志，这种情况会告警 |
+| 容器一直卡在 `Created`，起不来，报 `failed to set up container networking: Address already in use` | **不是 IP 被真实设备占了**，是 Docker 网络 IPAM 里留了一条**孤儿端点**：爱快 `update` 是「删了重建」，新建失败时旧容器已删、旧端点没回收，平时照样能跑，**重启后**才撞车。删这个容器重建无效、`docker_server down → up` 也无效，只能重建网络 → 见 [`docs/ipam-endpoint-ghost.md`](../docs/ipam-endpoint-ghost.md) |
 | 镜像一直下不完 | 调大 `PULL_TIMEOUT`。超时只会跳过这个容器，**绝不会拿旧镜像去重建**，不会把服务搞坏 |
 | 时间显示不对 | 确认 `TZ=Asia/Shanghai`，且镜像里装了 `tzdata` |
 
@@ -327,6 +328,7 @@ webapp/
 | 文件 | 作用 |
 |---|---|
 | `ikuai_docker_updater.py` | 等价的命令行版（`list` / `check` / `update` / `tags` / `server`） |
+| `docs/ipam-endpoint-ghost.md` | 固定 IP 容器重启后 `Address already in use` 的成因、证据与处置（IPAM 孤儿端点） |
 | `API_REFERENCE.md` | 爱快 4.0 Docker 接口完整参考（实测） |
 | `mine_ikuai_api.py` | 接口挖掘工具，固件升级后用来重新提取接口 |
 | `fnos_ssh.py` / `deploy_webapp.py` | 免交互 SSH / 一键同步部署 |
